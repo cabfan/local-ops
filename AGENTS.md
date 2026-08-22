@@ -1,6 +1,6 @@
 # 总控台 (Console)
 
-本地服务监控与快速启动控制台。**零依赖**：Python 3 标准库后端（单文件）+ 无构建原生前端。macOS 推荐双击 `总控台.app` 后台运行（不显示 Terminal/Dock）；`start.command` 保留为终端调试入口。Linux 用 `start.sh`（或 `tools/install-linux.sh` 安装桌面入口）；平台差异（数据/日志目录、`ps/lsof` 与 `/proc`、`osascript` 与 `zenity`）在 `server.py` 内按 `IS_MACOS`/`IS_LINUX` 分支处理。
+本地服务监控与快速启动控制台。**零依赖**：Python 3 标准库后端（单文件）+ 无构建原生前端。macOS 推荐双击 `总控台.app` 后台运行（不显示 Terminal/Dock）；`start.command` 保留为终端调试入口。Linux 用 `start.sh`（或 `tools/install-linux.sh` 安装桌面入口）。Windows 用 `start.ps1` / `start.cmd`（双击或 PowerShell 运行）；平台差异（数据/日志目录、`ps/lsof` 与 `/proc` 与 `netstat`/`taskkill`、`osascript` 与 `zenity` 与 PowerShell）在 `server.py` 内按 `IS_MACOS`/`IS_LINUX`/`IS_WINDOWS` 分支处理。
 
 ## 结构
 

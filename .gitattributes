@@ -1,5 +1,10 @@
 * text=auto eol=lf
 
+# Windows 脚本以 CRLF 检出，cmd/ps1 更稳
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
 *.icns binary
 *.ico binary
 *.jpg binary

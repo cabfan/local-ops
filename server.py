@@ -8,8 +8,13 @@ API 契约与实现要点见 AGENTS.md。
 """
 
 import glob
-import fcntl
+try:
+    import fcntl  # POSIX 文件锁；Windows 上没有，改用 msvcrt。
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 import functools
+import csv
+import datetime
 import errno
 import json
 import logging
@@ -37,19 +42,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# 目标平台：macOS 原生路径 / Linux XDG 路径。
+# 目标平台：macOS 原生路径 / Linux XDG 路径 / Windows LOCALAPPDATA。
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
+IS_WINDOWS = os.name == "nt"
 
 
 def _default_data_dir():
     """平台默认数据目录（配置 + 图标）。
 
     macOS 沿用 ``~/Library/Application Support/总控台``；Linux/其他 POSIX
-    使用 XDG（``$XDG_DATA_HOME`` 或 ``~/.local/share``）。
+    使用 XDG（``$XDG_DATA_HOME`` 或 ``~/.local/share``）；Windows 使用
+    ``%LOCALAPPDATA%\\总控台``。
     """
     if IS_MACOS:
         return os.path.expanduser("~/Library/Application Support/总控台")
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "总控台")
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(
         os.path.expanduser("~"), ".local", "share")
     return os.path.join(base, "总控台")
@@ -59,10 +69,14 @@ def _default_logs_dir():
     """平台默认日志目录。
 
     macOS 沿用 ``~/Library/Logs/总控台``；Linux/其他 POSIX 使用 XDG state
-    （``$XDG_STATE_HOME`` 或 ``~/.local/state``）。
+    （``$XDG_STATE_HOME`` 或 ``~/.local/state``）；Windows 使用
+    ``%LOCALAPPDATA%\\总控台\\logs``。
     """
     if IS_MACOS:
         return os.path.expanduser("~/Library/Logs/总控台")
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "总控台", "logs")
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(
         os.path.expanduser("~"), ".local", "state")
     return os.path.join(base, "总控台")
@@ -139,12 +153,24 @@ RUN_TOKEN_ARG_PREFIX = "console-run:"
 TASK_CANCELED_EXIT_CODE = 130
 
 SELF_PID = os.getpid()
-SELF_UID = os.getuid()
+# Windows 没有 uid 概念，统一用 0 作为哨兵；所有「当前用户」判定都
+# 依赖 ps 快照里的 uid == SELF_UID，Windows 分支会帮每条记录填入 0。
+SELF_UID = os.getuid() if hasattr(os, "getuid") else 0
 ICON_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".ico")
 LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+
+
+def _fchmod(fd, mode):
+    """对 fd 设权限；Windows 无 fchmod/无 POSIX 权限位，静默忽略。"""
+    if IS_WINDOWS:
+        return
+    try:
+        os.fchmod(fd, mode)
+    except (AttributeError, OSError):
+        pass
 
 
 def classify_task_exit(code):
@@ -568,6 +594,34 @@ class Config:
         os.chmod(path, 0o600)
 
 
+def _flock_exclusive_nonblock(fileobj):
+    """尝试对文件加排它非阻塞锁；成功返回 True，被占用时抛 OSError(EACCES)。
+
+    POSIX 用 ``fcntl.flock``；Windows 用 ``msvcrt.locking`` 锁文件起始 1 字节
+    （Windows 没有 flock）。调用方按 ``O_CREAT`` 打开文件后，先生成再锁定。
+    """
+    if fcntl is not None:
+        fcntl.flock(fileobj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    import msvcrt  # pragma: no cover - Windows
+    fileobj.seek(0)
+    if fileobj.seek(0, os.SEEK_END) == 0:  # 空文件先占位，保证字节范围可锁
+        fileobj.write("\0")
+        fileobj.flush()
+    fileobj.seek(0)
+    msvcrt.locking(fileobj.fileno(), msvcrt.LK_NBLCK, 1)
+    return True
+
+
+def _funlock(fileobj):
+    if fcntl is not None:
+        fcntl.flock(fileobj.fileno(), fcntl.LOCK_UN)
+        return
+    import msvcrt  # pragma: no cover - Windows
+    fileobj.seek(0)
+    msvcrt.locking(fileobj.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
     """Acquire the per-project process lock and keep its file object alive.
 
@@ -580,21 +634,21 @@ def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     lock_file = os.fdopen(fd, "r+", encoding="ascii")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _flock_exclusive_nonblock(lock_file)
     except OSError as e:
         lock_file.close()
         if e.errno in (errno.EACCES, errno.EAGAIN):
             return None
         raise
     try:
-        os.fchmod(lock_file.fileno(), 0o600)
+        _fchmod(lock_file.fileno(), 0o600)
         lock_file.seek(0)
         lock_file.truncate()
         lock_file.write("%d\n" % SELF_PID)
         lock_file.flush()
         os.fsync(lock_file.fileno())
     except OSError:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        _funlock(lock_file)
         lock_file.close()
         raise
     return lock_file
@@ -604,7 +658,7 @@ def release_instance_lock(lock_file):
     if lock_file is None:
         return
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        _funlock(lock_file)
     finally:
         lock_file.close()
 
@@ -647,6 +701,223 @@ def _to_float(tok, default=0.0):
         return float(tok)
     except (TypeError, ValueError):
         return default
+
+
+# ---------------------------------------------------------------- Windows 采集
+# Windows 没有 lsof / ps / procfs，用 netstat 与 PowerShell（Win32_Process /
+# Get-Process）提供等价数据。采集走 run_cmd，异常/超时一律返回空、不上抛。
+
+_WIN_PROCESS_CSV = (
+    "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+    "Select-Object ProcessId,ParentProcessId,Name,CommandLine,"
+    "@{n='EpochStart';e={[int64](($_.CreationDate - [datetime]'1970-01-01').TotalSeconds)}} | "
+    "ConvertTo-Csv -NoTypeInformation")
+_WIN_MEM_CSV = (
+    "Get-Process -ErrorAction SilentlyContinue | "
+    "Select-Object Id,CPU,WorkingSet | ConvertTo-Csv -NoTypeInformation")
+
+
+def _ps_command(script):
+    """把一段 PowerShell 命令包成可执行参数列表。"""
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def _csv_rows(text):
+    """解析 PowerShell ConvertTo-Csv 输出 → [{列: 值}, ...]。"""
+    text = (text or "").lstrip("\ufeff").lstrip()
+    if not text:
+        return []
+    try:
+        return list(csv.DictReader(text.splitlines()))
+    except Exception:
+        rows = []
+        for line in (text or "").splitlines():
+            if "," in line:
+                rows.append({"_": line})
+        return rows
+
+
+def _parse_windows_epoch_start(value):
+    """Win32_Process EpochStart（Unix 秒）→ int；异常返回 None。"""
+    try:
+        return int(float(str(value or "0").strip() or 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_netstat_listeners(out):
+    """netstat -ano -p tcp → {(pid, port): {bind_host}}。仅取 LISTENING 行。"""
+    found = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("TCP"):
+            continue
+        parts = line.split()
+        if len(parts) < 5 or "LISTENING" not in parts:
+            continue
+        try:
+            pid = int(parts[-1])
+        except ValueError:
+            continue
+        host, _, port_s = parts[1].rpartition(":")
+        if not port_s.isdigit():
+            continue
+        port = int(port_s)
+        if not 1 <= port <= 65535:
+            continue
+        found.setdefault((pid, port), set()).add(host.strip("[]"))
+    return found
+
+
+def _scan_listeners_windows():
+    return _parse_netstat_listeners(run_cmd(["netstat", "-ano", "-p", "tcp"]))
+
+
+def _ps_snapshot_windows(pids=None):
+    """Windows 进程快照 → {pid: {uid, comm, args, cpu, mem, etime}}。
+
+    uid 统一为 SELF_UID（Windows 无 uid；tasklist 会话即当前用户）。
+    args 取自 Win32_Process.CommandLine，供 run-token 校验；cpu 用 CPU 秒、
+    mem 用工作集 MB（近似），etime 由创建时间推导。
+    """
+    now = time.time()
+    snap = {}
+    for row in _csv_rows(run_cmd(_ps_command(_WIN_PROCESS_CSV))):
+        try:
+            pid = int(row.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        epoch = _parse_windows_epoch_start(row.get("EpochStart"))
+        snap[pid] = {
+            "uid": SELF_UID,
+            "comm": str(row.get("Name") or ""),
+            "args": str(row.get("CommandLine") or ""),
+            "cpu": 0.0,
+            "mem": 0.0,
+            "etime": max(0, int(now - epoch)) if epoch is not None else 0,
+        }
+    for row in _csv_rows(run_cmd(_ps_command(_WIN_MEM_CSV))):
+        try:
+            pid = int(row.get("Id"))
+        except (TypeError, ValueError):
+            continue
+        if pid not in snap:
+            continue
+        try:
+            snap[pid]["cpu"] = round(_to_float(row.get("CPU")), 2)
+        except (TypeError, ValueError):
+            pass
+        try:
+            snap[pid]["mem"] = round(
+                _to_float(row.get("WorkingSet")) / (1024.0 * 1024.0), 2)
+        except (TypeError, ValueError):
+            pass
+    if pids is not None:
+        wanted = {int(p) for p in pids}
+        snap = {p: v for p, v in snap.items() if p in wanted}
+    return snap
+
+
+def _lsof_cwds_windows(pids):
+    """Windows 尽力取「cwd」：用可执行文件所在目录作为较低置信度的工作目录。
+
+    Windows 没有可靠的 cwd API；返回空目录时不匹配，避免错误关联。
+    """
+    pids = [int(p) for p in pids]
+    if not pids:
+        return {}
+    filt = " or ".join("ProcessId=%d" % p for p in pids)
+    script = (
+        'Get-CimInstance Win32_Process -Filter "%s" | '
+        'Select-Object ProcessId,ExecutablePath | ConvertTo-Csv -NoTypeInformation'
+        % filt)
+    result = {}
+    for row in _csv_rows(run_cmd(_ps_command(script))):
+        try:
+            pid = int(row.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        exe = str(row.get("ExecutablePath") or "")
+        if exe:
+            try:
+                result[pid] = os.path.dirname(os.path.realpath(exe))
+            except OSError:
+                continue
+    return result
+
+
+def _proc_children_map():
+    """一次 CIM 查询 -> {pid: set(children)}（含叶子节点）。"""
+    children = {}
+    for row in _csv_rows(run_cmd(_ps_command(_WIN_PROCESS_CSV))):
+        try:
+            pid = int(row.get("ProcessId"))
+            ppid = int(row.get("ParentProcessId"))
+        except (TypeError, ValueError):
+            continue
+        children.setdefault(pid, set())
+        children.setdefault(ppid, set()).add(pid)
+    return children
+
+
+def _pgid_members_map_windows():
+    """Windows：用进程树模拟 POSIX 进程组 → {组长 pid: [整棵后代树]}。
+
+    实际只被 app.lastPid/lastPgid 查询，因此对每个 pid 求出其全部存活后代。
+    循环保护（父进程链偶尔成环）保证不死循环。
+    """
+    children = _proc_children_map()
+    result = {}
+    for pid in children:
+        tree = []
+        stack = [pid]
+        while stack:
+            cur = stack.pop()
+            if cur in tree:
+                continue
+            tree.append(cur)
+            stack.extend(children.get(cur, ()))
+        result[pid] = tree
+    return result
+
+
+def _pid_alive_windows(pid):
+    """无副作用地探测进程是否存活（Windows 没有 os.kill(pid,0)）。"""
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    except Exception:
+        return False
+
+
+def _taskkill(pid, tree=True, force=False):
+    """Windows：结束单个进程或整棵进程树。返回 (ok, error)。"""
+    args = ["taskkill", "/PID", str(int(pid))]
+    if tree:
+        args.append("/T")
+    if force:
+        args.append("/F")
+    try:
+        r = subprocess.run(args, capture_output=True, text=True,
+                           timeout=SUBPROCESS_TIMEOUT)
+    except Exception as e:
+        return False, "结束失败: %s" % e
+    if r.returncode != 0:
+        return False, "结束失败: %s" % (r.stderr.strip() or "未知错误")
+    return True, None
+
+
+def _process_uid_windows(pid):
+    """Windows：进程存在即视为当前用户（哨兵 SELF_UID）。"""
+    if not _pid_alive_windows(int(pid)):
+        return None
+    return SELF_UID
 
 
 def _parse_lsof_listeners(out):
@@ -784,8 +1055,11 @@ def scan_listeners():
 
     字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
     供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
-    Linux 上 lsof 缺失或不可读取时回落到 ``/proc``，保证零依赖可用。
+    Linux 上 lsof 缺失或不可读取时回落到 ``/proc``，保证零依赖可用；
+    Windows 用 ``netstat``。
     """
+    if IS_WINDOWS:
+        return _scan_listeners_windows()
     found = _parse_lsof_listeners(
         run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"]))
     if found or not IS_LINUX:
@@ -830,7 +1104,10 @@ def ps_snapshot(pids=None, with_uid=True):
     其余部分（可含空格）即 comm；args 单独一次 ps 取。
     注意：不能用 `comm=` 抑制表头——macOS ps 会把空表头列压到 16 字节截断
     内容；保留表头后解析时跳过表头行即可（首列非数字的行）。
+    Windows 走 PowerShell/Win32_Process + Get-Process。
     """
+    if IS_WINDOWS:
+        return _ps_snapshot_windows(pids)
     base = ["ps"]
     if pids is None:
         base.append("-ax")
@@ -885,8 +1162,11 @@ def ps_snapshot(pids=None, with_uid=True):
 def lsof_cwds(pids):
     """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。
 
-    Linux 上 lsof 缺失、或个别进程查不到 cwd 时，用 ``/proc/<pid>/cwd`` 兜底。
+    Linux 上 lsof 缺失、或个别进程查不到 cwd 时，用 ``/proc/<pid>/cwd`` 兜底；
+    Windows 用可执行文件目录作为尽力 cwd（``_lsof_cwds_windows``）。
     """
+    if IS_WINDOWS:
+        return _lsof_cwds_windows(pids)
     pids = [int(p) for p in pids]
     if not pids:
         return {}
@@ -914,6 +1194,8 @@ def lsof_cwds(pids):
 
 
 def pid_alive(pid):
+    if IS_WINDOWS:
+        return _pid_alive_windows(int(pid))
     try:
         os.kill(int(pid), 0)
         return True
@@ -1178,8 +1460,13 @@ def build_watched(keywords):
 
 def pgid_members_map():
     """ps -axo pid=,pgid= → {pgid: [pid, ...]}。
+
     进程退出后其子孙仍保留原 pgid（被 launchd 收养也不变），
-    因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。"""
+    因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。
+    Windows 没有 pgid，改用进程树模拟（``_pgid_members_map_windows``）。
+    """
+    if IS_WINDOWS:
+        return _pgid_members_map_windows()
     groups = {}
     for line in run_cmd(["ps", "-axo", "pid=,pgid="]).splitlines():
         parts = line.split()
@@ -1501,7 +1788,7 @@ def build_health(cfg):
         else:
             try:
                 mode = os.lstat(path).st_mode
-                if stat.S_ISLNK(mode) or mode & 0o077:
+                if stat.S_ISLNK(mode) or (not IS_WINDOWS and mode & 0o077):
                     issues.append("%s 目录权限不是 0700" % label)
             except OSError as e:
                 issues.append("无法检查 %s 目录: %s" % (label, e))
@@ -1516,7 +1803,7 @@ def build_health(cfg):
         except OSError as e:
             issues.append("无法检查 %s: %s" % (label, e))
             continue
-        if not stat.S_ISREG(mode) or mode & 0o077:
+        if not stat.S_ISREG(mode) or (not IS_WINDOWS and mode & 0o077):
             issues.append("%s 文件权限不是 0600" % label)
     degraded = bool(issues)
     snapshot = cfg.snapshot()
@@ -1566,7 +1853,9 @@ def list_themes():
 # ---------------------------------------------------------------- 进程/应用操作
 
 def process_uid(pid):
-    """返回进程 uid；进程不存在返回 None。"""
+    """返回进程 uid；进程不存在返回 None。Windows 用存在性+哨兵 uid。"""
+    if IS_WINDOWS:
+        return _process_uid_windows(int(pid))
     out = run_cmd(["ps", "-o", "uid=", "-p", str(int(pid))])
     toks = out.split()
     if not toks:
@@ -1586,6 +1875,8 @@ def kill_process(pid, force):
         return False, "进程不存在"
     if uid != SELF_UID:
         return False, "只能结束当前用户的进程"
+    if IS_WINDOWS:
+        return _taskkill(pid, tree=False, force=force)
     sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.kill(pid, sig)
@@ -1605,7 +1896,11 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
     signal and is therefore an idempotent success. Permission and other OS
     failures must never be swallowed: callers use them to retain management
     identity instead of creating an orphan process.
+    Windows 用 taskkill /T 结束进程树。
     """
+    if IS_WINDOWS:
+        # Windows 无法对控制台进程优雅发送信号，taskkill /T /F 可靠结束进程树。
+        return _taskkill(int(pid), tree=True, force=True)
     try:
         os.killpg(int(pid), sig)
         return True, None
@@ -1658,6 +1953,20 @@ def build_launch_env(token, environ=None):
     preferred.extend(sorted(
         glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation", "bin")),
         reverse=True))
+    if IS_WINDOWS:
+        # Windows 常见开发工具目录（npm/node、WinGet、cargo、bun、dotnet）。
+        appdata = env.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        localappdata = env.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        programfiles = env.get("ProgramFiles") or r"C:\Program Files"
+        preferred += [
+            os.path.join(appdata, "npm"),
+            os.path.join(localappdata, "Programs", "nodejs"),
+            os.path.join(localappdata, "Microsoft", "WinGet", "Links"),
+            os.path.join(home, ".cargo", "bin"),
+            os.path.join(home, ".bun", "bin"),
+            os.path.join(programfiles, "nodejs"),
+            os.path.join(programfiles, "dotnet"),
+        ]
     preferred.extend((env.get("PATH") or "").split(os.pathsep))
     preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
     seen = set()
@@ -1674,9 +1983,12 @@ def _ensure_dotnet_env(env, home):
 
     framework-dependent 的 apphost 直接运行时会依赖 DOTNET_ROOT 定位运行时；
     dotnet CLI 需要其 bin 目录在 PATH。这里只探测真实存在的位置，不猜测版本。
+    Windows 上二进制为 dotnet.exe、默认装在 %ProgramFiles%/dotnet。
     """
-    roots = [os.path.join(home, ".dotnet"), "/usr/lib/dotnet",
-             "/usr/share/dotnet", "/usr/local/share/dotnet"]
+    dotnet_name = "dotnet.exe" if IS_WINDOWS else "dotnet"
+    programfiles = env.get("ProgramFiles") or r"C:\Program Files"
+    roots = [os.path.join(home, ".dotnet"), os.path.join(programfiles, "dotnet"),
+             "/usr/lib/dotnet", "/usr/share/dotnet", "/usr/local/share/dotnet"]
     # 优先使用当前 PATH 里能找到的 dotnet（可能是任意安装方式）。
     existing_root = None
     dotnet_path = shutil.which("dotnet", path=env.get("PATH") or None)
@@ -1684,7 +1996,7 @@ def _ensure_dotnet_env(env, home):
         existing_root = os.path.dirname(os.path.realpath(dotnet_path))
     candidates = ([existing_root] if existing_root else []) + roots
     for root in candidates:
-        if not root or not os.path.isfile(os.path.join(root, "dotnet")):
+        if not root or not os.path.isfile(os.path.join(root, dotnet_name)):
             continue
         env.setdefault("DOTNET_ROOT", root)
         env.setdefault("DOTNET_ROOT_X64", root)
@@ -1706,25 +2018,40 @@ def start_app(app):
     try:
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
                          0o600)
-        os.fchmod(log_fd, 0o600)
+        _fchmod(log_fd, 0o600)
         logf = os.fdopen(log_fd, "ab", buffering=0)
     except OSError as e:
         return False, "无法打开日志文件: %s" % e, None, None, None
     token = secrets.token_urlsafe(24)
     env = build_launch_env(token)
     marker = RUN_TOKEN_ARG_PREFIX + token
-    # 外层 shell 在 argv[0] 中持有随机标记并等待内层；内层等待用户命令
-    # 留下的后台作业。因此进程组既可验证，也不会因启动脚本过早退出而失去锚点。
-    outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
-    inner_script = (app["command"] +
-                    '\nconsole_status=$?\nwait\nexit "$console_status"')
     try:
         header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
         logf.write(header.encode("utf-8"))
-        proc = subprocess.Popen(
-            ["/bin/bash", "-c", outer_script, marker, inner_script],
-            cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True, env=env)
+        if IS_WINDOWS:
+            # 外层 cmd.exe 在命令行里持有随机标记（作为无害的 set），
+            # 使 token 校验能通过 Win32_Process.CommandLine 定位到该进程组；
+            # 后半段真正执行用户命令。taskkill /T 按进程树停止。
+            cmd_string = 'set "%s=%s" & %s' % (RUN_TOKEN_ENV, marker, app["command"])
+            creationflags = 0
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                creationflags |= subprocess.CREATE_NO_WINDOW
+            if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+            proc = subprocess.Popen(
+                ["cmd.exe", "/c", cmd_string],
+                cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
+                creationflags=creationflags, env=env)
+        else:
+            # 外层 shell 在 argv[0] 中持有随机标记并等待内层；内层等待用户命令
+            # 留下的后台作业。因此进程组既可验证，也不会因启动脚本过早退出而失去锚点。
+            outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
+            inner_script = (app["command"] +
+                            '\nconsole_status=$?\nwait\nexit "$console_status"')
+            proc = subprocess.Popen(
+                ["/bin/bash", "-c", outer_script, marker, inner_script],
+                cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True, env=env)
     except Exception as e:
         logf.close()
         return False, "启动失败: %s" % e, None, None, None
@@ -1905,18 +2232,59 @@ def _pick_path_linux(what):
     return _pick_path_tk(what)
 
 
+def _pick_path_windows(what):
+    """Windows 原生文件/目录选择框（PowerShell + System.Windows.Forms）。
+    返回 (path|None, canceled)；取消不是错误。"""
+    title = "选择工作目录" if what == "dir" else "选择批处理脚本"
+    script = ("Add-Type -AssemblyName System.Windows.Forms; "
+              "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+              "$d.Description = '%s'; "
+              "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+              "{ [Console]::Out.Write($d.SelectedPath); exit 0 } else { exit 1 }"
+              % title) if what == "dir" else (
+              "Add-Type -AssemblyName System.Windows.Forms; "
+              "$o = New-Object System.Windows.Forms.OpenFileDialog; "
+              "$o.Title = '%s'; "
+              "$o.Multiselect = $false; "
+              "$o.Filter = '脚本 (*.py;*.ps1;*.cmd;*.bat;*.js;*.sh)|*.py;*.ps1;*.cmd;*.bat;*.js;*.sh|所有文件 (*.*)|*.*'; "
+              "if ($o.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+              "{ [Console]::Out.Write($o.FileName); exit 0 } else { exit 1 }"
+              % title)
+    try:
+        r = subprocess.run(_ps_command(script), capture_output=True, text=True,
+                           timeout=300)
+    except Exception:
+        return None, False
+    if r.returncode == 0:
+        return r.stdout.strip().rstrip("\\/") or None, False
+    return None, True  # 取消
+
+
 def pick_path(what):
     """跨平台文件/目录选择框。返回 (path|None, canceled)；取消不是错误。"""
     if IS_MACOS:
         return _pick_path_macos(what)
+    if IS_WINDOWS:
+        return _pick_path_windows(what)
     return _pick_path_linux(what)
 
 
 def command_for_script(path):
     """按脚本类型生成可直接保存的 shell 命令，并安全引用任意文件名。"""
     normalized = os.path.abspath(os.path.expanduser(str(path)))
-    quoted = shlex.quote(normalized)
     suffix = os.path.splitext(normalized)[1].lower()
+    if IS_WINDOWS:
+        # Windows 用 cmd 双引号引用路径，运行时用 python/powershell/node。
+        if suffix == ".py":
+            return 'python -- "%s"' % normalized
+        if suffix == ".js":
+            return 'node -- "%s"' % normalized
+        if suffix == ".ps1":
+            return 'powershell -NoProfile -ExecutionPolicy Bypass -File "%s"' % normalized
+        if suffix in (".cmd", ".bat"):
+            return '"%s"' % normalized
+        return '"%s"' % normalized
+    quoted = shlex.quote(normalized)
     if suffix == ".py":
         return "python3 -- %s" % quoted
     if suffix == ".zsh":
@@ -2436,7 +2804,8 @@ def resolve_app_stop_target(app, listeners=None):
         return None, "受控进程组信息无效"
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
-        if app.get("attached"):
+        # Windows 没有 pgid/pgrp，attached 进程按单一 PID 停止（taskkill /T 树）。
+        if app.get("attached") and not IS_WINDOWS:
             try:
                 pgid = os.getpgid(legacy_pid)
             except (ProcessLookupError, PermissionError, OSError):
@@ -2481,6 +2850,14 @@ def signal_app_stop(target, sig=signal.SIGTERM):
 
 
 def stop_target_alive(target, expected_uid=None):
+    if IS_WINDOWS:
+        # taskkill /T 结束后整棵进程树；等待期间检查原树成员是否仍有存活。
+        if target["kind"] == "group":
+            members = target.get("members")
+            if members:
+                return any(_pid_alive_windows(int(p)) for p in members)
+            return _pid_alive_windows(target["id"])
+        return _pid_alive_windows(target["id"])
     if target["kind"] == "group":
         try:
             os.killpg(target["id"], 0)
@@ -4231,6 +4608,10 @@ end run"""
 
 def launcher_main():
     """start.command 的无命令启动入口。"""
+    if IS_WINDOWS:
+        # Windows 没有 zenity/osascript；直接用唯一实例逻辑（锁+浏览器）启动。
+        main(log_to_file=True)
+        return
     instances = find_console_instances()
     if not instances:
         try:
@@ -4357,7 +4738,7 @@ def redirect_console_output():
     path = os.path.join(LOGS_DIR, "console.log")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        _fchmod(fd, 0o600)
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()

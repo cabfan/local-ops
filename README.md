@@ -35,9 +35,10 @@
 
 ## 系统要求
 
-- macOS 12 或更高版本；或 Linux（`x86_64` / `aarch64`，带 `/proc` 与桌面环境）。
+- macOS 12 或更高版本；Linux（`x86_64` / `aarch64`，带 `/proc` 与桌面环境）；或 Windows 10/11。
 - Python 3.12。运行时仅使用 Python 标准库。
-- macOS：系统自带的 `ps`、`lsof`、`osascript`；Linux：`ps` 与 `lsof`（缺失时自动回落到 `/proc`），选择框优先用 `zenity` / `kdialog`（兜底 Tk）。
+- macOS：系统自带的 `ps`、`lsof`、`osascript`；Linux：`ps` 与 `lsof`（缺失时自动回落到 `/proc`），选择框优先用 `zenity` / `kdialog`（兜底 Tk）；Windows：`netstat`、`taskkill` 与 PowerShell（监听扫描、进程快照、选择框）。
+- 总控台尽量复用脚本式命令；Windows 下可直接保存 `.py` / `.ps1` / `.cmd` / `.bat` / `.js`。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
@@ -106,6 +107,23 @@ chmod +x start.sh
 
 安装后可在系统应用菜单搜索「总控台」打开。命令行参数、环境变量与 macOS 一致，见下文“数据、隐私与备份”。
 
+### Windows 运行
+
+Windows 上用脚本启动，等价于 Linux 的 `start.sh`：
+
+```powershell
+# PowerShell：在项目目录运行
+.\start.ps1              # 前台运行，自动打开浏览器
+```
+
+或双击 `start.cmd`（控制台启动，便于看实时输出）。两者都会校验 Python 3.12 后运行 `python server.py`，监听 `127.0.0.1:9600` 并自动打开浏览器。
+
+- 监听扫描用 `netstat -ano -p tcp`，进程快照用 PowerShell（`Win32_Process` / `Get-Process`），停止用 `taskkill /T`，选择框用 `System.Windows.Forms`。
+- 单实例锁、运行 token 与进程树识别均已适配；进程工作目录在 Windows 上以可执行文件目录作为尽力结果，因此「按 cwd 认领旧进程」在 Windows 上可能受限。
+- 应用保存 `.cmd` / `.bat` / `.ps1` / `.py` 等命令时，用双引号引用路径，可直接在 `cmd.exe` 下运行。
+
+命令行参数、环境变量与 macOS/Linux 一致，见下文“数据、隐私与备份”。
+
 ## 使用
 
 打开页面后，左侧是导航轨，右侧是信息栏；所有数据每 2 秒自动刷新。
@@ -155,14 +173,14 @@ chmod +x start.sh
 
 ## 数据、隐私与备份
 
-运行数据与程序目录分离。macOS 默认放在用户资料库；Linux 遵循 XDG 规范：
+运行数据与程序目录分离。macOS 默认放在用户资料库；Linux 遵循 XDG 规范；Windows 用 `%LOCALAPPDATA%`：
 
-| 用途 | macOS 默认路径 | Linux 默认路径 |
-| --- | --- | --- |
-| 配置 | `~/Library/Application Support/总控台/config.json` | `$XDG_DATA_HOME/总控台/config.json`（默认 `~/.local/share/总控台/`） |
-| 配置备份 | `~/Library/Application Support/总控台/config.json.bak` | `$XDG_DATA_HOME/总控台/config.json.bak` |
-| 图标 | `~/Library/Application Support/总控台/icons/` | `$XDG_DATA_HOME/总控台/icons/` |
-| 日志 | `~/Library/Logs/总控台/` | `$XDG_STATE_HOME/总控台/`（默认 `~/.local/state/总控台/`） |
+| 用途 | macOS 默认路径 | Linux 默认路径 | Windows 默认路径 |
+| --- | --- | --- | --- |
+| 配置 | `~/Library/Application Support/总控台/config.json` | `$XDG_DATA_HOME/总控台/config.json`（默认 `~/.local/share/总控台/`） | `%LOCALAPPDATA%/总控台/config.json` |
+| 配置备份 | `~/Library/Application Support/总控台/config.json.bak` | `$XDG_DATA_HOME/总控台/config.json.bak` | `%LOCALAPPDATA%/总控台/config.json.bak` |
+| 图标 | `~/Library/Application Support/总控台/icons/` | `$XDG_DATA_HOME/总控台/icons/` | `%LOCALAPPDATA%/总控台/icons/` |
+| 日志 | `~/Library/Logs/总控台/` | `$XDG_STATE_HOME/总控台/`（默认 `~/.local/state/总控台/`） | `%LOCALAPPDATA%/总控台/logs/` |
 
 目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
 

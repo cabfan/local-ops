@@ -151,5 +151,128 @@ class DotnetTests(unittest.TestCase):
         self.assertIn(dotnet_dir, env["PATH"])
 
 
+class WindowsScanTests(unittest.TestCase):
+    """Windows 平台解析器（用模拟命令输出在 Linux 上验证）。"""
+
+    def test_parse_netstat_listeners(self):
+        out = (
+            "  Proto  Local Address          Foreign Address        State           PID\n"
+            "  TCP    127.0.0.1:8080         0.0.0.0:0              LISTENING       1234\n"
+            "  TCP    [::]:9600              [::]:0                 LISTENING       789\n"
+            "  TCP    127.0.0.1:5432         0.0.0.0:0              LISTENING       2345\n"
+            "  TCP    127.0.0.1:9999         0.0.0.0:0              TIME_WAIT       111\n"
+        )
+        got = server._parse_netstat_listeners(out)
+        self.assertEqual(got[(1234, 8080)], {"127.0.0.1"})
+        self.assertEqual(got[(789, 9600)], {"::"})
+        self.assertEqual(got[(2345, 5432)], {"127.0.0.1"})
+        self.assertNotIn((111, 9999), got)  # 非 LISTENING 行忽略
+
+    def test_windows_ps_snapshot_parses_csv(self):
+        proc_csv = (
+            '"ProcessId","ParentProcessId","Name","CommandLine","EpochStart"\n'
+            '"123","1","node.exe","node server.js","1700000000"\n'
+            '"234","1","python.exe","python app.py","1700000001"\n')
+        mem_csv = (
+            '"Id","CPU","WorkingSet"\n'
+            '"123","12.5","104857600"\n"234","0.75","52428800"\n')
+        with mock.patch.object(server, "run_cmd",
+                               side_effect=[proc_csv, mem_csv]):
+            snap = server._ps_snapshot_windows()
+        self.assertIn(123, snap)
+        self.assertEqual(snap[123]["comm"], "node.exe")
+        self.assertEqual(snap[123]["args"], "node server.js")
+        self.assertEqual(snap[123]["cpu"], 12.5)
+        self.assertEqual(snap[123]["mem"], 100.0)
+        self.assertEqual(snap[123]["uid"], server.SELF_UID)
+        self.assertGreaterEqual(snap[123]["etime"], 0)
+
+    def test_windows_pgid_map_is_process_tree(self):
+        proc_csv = (
+            '"ProcessId","ParentProcessId","Name","CommandLine","EpochStart"\n'
+            '"100","1","cmd.exe","cmd /c x","1700000000"\n'
+            '"200","100","node.exe","node srv","1700000001"\n'
+            '"300","200","node.exe","child","1700000002"\n')
+        with mock.patch.object(server, "run_cmd", return_value=proc_csv):
+            groups = server._pgid_members_map_windows()
+        self.assertEqual(set(groups[100]), {100, 200, 300})
+        self.assertEqual(set(groups[200]), {200, 300})
+        self.assertEqual(set(groups[300]), {300})
+
+    def test_windows_cwds_uses_exec_dir(self):
+        # 注意：在 Linux 上 os.path.realpath 把反斜杠当普通字符，因而用平台无关
+        # 的绝对路径来验证「取可执行文件所在目录」的逻辑。
+        csv = '"ProcessId","ExecutablePath"\n"123","/opt/node/node.exe"\n'
+        with mock.patch.object(server, "run_cmd", return_value=csv):
+            got = server._lsof_cwds_windows([123])
+        self.assertEqual(got[123], os.path.dirname("/opt/node/node.exe"))
+
+    def test_windows_scan_listeners_dispatch(self):
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "_scan_listeners_windows",
+                                  return_value={(10, 80): {"0.0.0.0"}}):
+            self.assertEqual(server.scan_listeners(), {(10, 80): {"0.0.0.0"}})
+
+    def test_command_for_script_windows(self):
+        with mock.patch.object(server, "IS_WINDOWS", True):
+            self.assertEqual(server.command_for_script("/a/b/app.py"),
+                             'python -- "/a/b/app.py"')
+            self.assertEqual(
+                server.command_for_script("/a/b/run.ps1"),
+                'powershell -NoProfile -ExecutionPolicy Bypass -File "/a/b/run.ps1"')
+            self.assertEqual(server.command_for_script("/a/b/x.js"),
+                             'node -- "/a/b/x.js"')
+            self.assertEqual(server.command_for_script("/a/b/t.cmd"),
+                             '"/a/b/t.cmd"')
+
+    def test_windows_default_dirs_use_localappdata(self):
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.dict(os.environ,
+                                {"LOCALAPPDATA": r"C:\Users\x\AppData\Local"},
+                                clear=False):
+            self.assertTrue(server._default_data_dir().endswith("总控台"))
+            self.assertTrue(server._default_logs_dir().endswith(
+                os.path.join("总控台", "logs")))
+
+
+class WindowsProcessDispatchTests(unittest.TestCase):
+    """Windows 进程/停止操作的分发与存活判定。"""
+
+    def test_stop_pid_tree_uses_taskkill(self):
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "_taskkill",
+                                  return_value=(True, None)) as tk:
+            self.assertEqual(server.stop_pid_tree(123), (True, None))
+        tk.assert_called_once()
+        self.assertEqual(tk.call_args[0], (123,))
+        self.assertEqual(tk.call_args[1]["tree"], True)
+        self.assertEqual(tk.call_args[1]["force"], True)
+
+    def test_stop_target_alive_group_uses_members(self):
+        target = {"kind": "group", "id": 100, "members": [100, 200, 300]}
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "_pid_alive_windows",
+                                  side_effect=[False, False, True]):
+            self.assertTrue(server.stop_target_alive(target))
+
+    def test_stop_target_alive_pid(self):
+        target = {"kind": "pid", "id": 55, "members": [55]}
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "_pid_alive_windows",
+                                  return_value=False):
+            self.assertFalse(server.stop_target_alive(target))
+
+    def test_kill_process_windows_dispatch(self):
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "_process_uid_windows",
+                                  return_value=server.SELF_UID), \
+                mock.patch.object(server, "_taskkill",
+                                  return_value=(True, None)) as tk:
+            self.assertEqual(server.kill_process(999, False), (True, None))
+        tk.assert_called_once()
+        self.assertEqual(tk.call_args[1]["force"], False)
+        self.assertEqual(tk.call_args[1]["tree"], False)
+
+
 if __name__ == "__main__":
     unittest.main()
