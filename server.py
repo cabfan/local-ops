@@ -19,7 +19,9 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,9 +36,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
-DEFAULT_DATA_DIR = os.path.expanduser(
-    "~/Library/Application Support/总控台")
-DEFAULT_LOGS_DIR = os.path.expanduser("~/Library/Logs/总控台")
+
+# 目标平台：macOS 原生路径 / Linux XDG 路径。
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _default_data_dir():
+    """平台默认数据目录（配置 + 图标）。
+
+    macOS 沿用 ``~/Library/Application Support/总控台``；Linux/其他 POSIX
+    使用 XDG（``$XDG_DATA_HOME`` 或 ``~/.local/share``）。
+    """
+    if IS_MACOS:
+        return os.path.expanduser("~/Library/Application Support/总控台")
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "总控台")
+
+
+def _default_logs_dir():
+    """平台默认日志目录。
+
+    macOS 沿用 ``~/Library/Logs/总控台``；Linux/其他 POSIX 使用 XDG state
+    （``$XDG_STATE_HOME`` 或 ``~/.local/state``）。
+    """
+    if IS_MACOS:
+        return os.path.expanduser("~/Library/Logs/总控台")
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "总控台")
+
+
+DEFAULT_DATA_DIR = os.path.abspath(_default_data_dir())
+DEFAULT_LOGS_DIR = os.path.abspath(_default_logs_dir())
 
 
 def resolve_runtime_dir(name, default):
@@ -616,13 +649,8 @@ def _to_float(tok, default=0.0):
         return default
 
 
-def scan_listeners():
-    """lsof 监听快照 → {(pid, port): {bind_host, ...}}。
-
-    字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
-    供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
-    """
-    out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
+def _parse_lsof_listeners(out):
+    """解析 lsof 监听输出 → {(pid, port): {bind_host, ...}}。"""
     found = {}
     for line in out.splitlines():
         if not line or line.startswith("COMMAND"):
@@ -649,6 +677,122 @@ def scan_listeners():
             continue
         found.setdefault((pid, port), set()).add(bind_host or "")
     return found
+
+
+def _decode_procfs_ipv4(hexaddr):
+    """/proc/net/tcp 的 8 位十六进制地址 → "127.0.0.1" 等。"""
+    if len(hexaddr) != 8:
+        return hexaddr
+    try:
+        return socket.inet_ntop(
+            socket.AF_INET, struct.pack("<I", int(hexaddr, 16)))
+    except (ValueError, OSError):
+        return hexaddr
+
+
+def _decode_procfs_ipv6(hexaddr):
+    """/proc/net/tcp6 的 32 位十六进制地址 → 压缩的 IPv6 字符串。"""
+    if len(hexaddr) != 32:
+        return hexaddr
+    try:
+        words = [int(hexaddr[i:i + 8], 16) for i in range(0, 32, 8)]
+        packed = b"".join(struct.pack("<I", word) for word in words)
+        return socket.inet_ntop(socket.AF_INET6, packed)
+    except (ValueError, OSError):
+        return hexaddr
+
+
+def _procfs_tcp_listen_tables():
+    """读取 /proc/net/tcp{,6} 的 LISTEN 行 → {inode: (port, bind_host)}。"""
+    tables = {}
+    for path, family in (("/proc/net/tcp", socket.AF_INET),
+                         ("/proc/net/tcp6", socket.AF_INET6)):
+        try:
+            with open(path, "r", encoding="ascii", errors="replace") as f:
+                next(f)  # 跳过表头
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != "0A":  # 0A = LISTEN
+                        continue
+                    local = parts[1]
+                    if ":" not in local:
+                        continue
+                    host_hex, port_hex = local.rsplit(":", 1)
+                    try:
+                        port = int(port_hex, 16)
+                    except ValueError:
+                        continue
+                    if not 1 <= port <= 65535:
+                        continue
+                    bind_host = (_decode_procfs_ipv6(host_hex)
+                                 if family == socket.AF_INET6
+                                 else _decode_procfs_ipv4(host_hex))
+                    tables[parts[9]] = (port, bind_host)
+        except OSError:
+            continue
+    return tables
+
+
+def _scan_listeners_procfs():
+    """Linux /proc 监听快照 → {(pid, port): {bind_host}}。
+
+    仅在 lsof 缺失/不可用时作为兜底：靠 ``/proc/net/tcp`` 的 inode 与
+    ``/proc/*/fd`` 的 socket:[inode] 把端口回连到 PID，零外部依赖。
+    """
+    tables = _procfs_tcp_listen_tables()
+    if not tables:
+        return {}
+    pid_by_inode = {}
+    need = set(tables)
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return {}
+    with entries:
+        for entry in entries:
+            if not need:
+                break
+            if not entry.name.isdigit():
+                continue
+            fd_dir = os.path.join("/proc", entry.name, "fd")
+            try:
+                fd_entries = os.scandir(fd_dir)
+            except OSError:
+                continue
+            with fd_entries:
+                for fd in fd_entries:
+                    try:
+                        target = os.readlink(os.path.join(fd_dir, fd.name))
+                    except OSError:
+                        continue
+                    if not target.startswith("socket:["):
+                        continue
+                    inode = target[len("socket:["):-1]
+                    if inode in need:
+                        pid_by_inode[inode] = int(entry.name)
+                        need.discard(inode)
+    found = {}
+    for inode, (port, host) in tables.items():
+        pid = pid_by_inode.get(inode)
+        if pid:
+            found.setdefault((pid, port), set()).add(host)
+    return found
+
+
+def scan_listeners():
+    """监听快照 → {(pid, port): {bind_host, ...}}。
+
+    字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
+    供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
+    Linux 上 lsof 缺失或不可读取时回落到 ``/proc``，保证零依赖可用。
+    """
+    found = _parse_lsof_listeners(
+        run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"]))
+    if found or not IS_LINUX:
+        return found
+    # lsof 完全不可用（命令缺失或始终空结果）时，用 procfs 兜底。
+    # 空结果不代表“没有监听者”，因此同样尝试一次。
+    return _scan_listeners_procfs()
 
 
 def listener_open_host(listeners, port, pids=None):
@@ -739,7 +883,10 @@ def ps_snapshot(pids=None, with_uid=True):
 
 
 def lsof_cwds(pids):
-    """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。"""
+    """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。
+
+    Linux 上 lsof 缺失、或个别进程查不到 cwd 时，用 ``/proc/<pid>/cwd`` 兜底。
+    """
     pids = [int(p) for p in pids]
     if not pids:
         return {}
@@ -755,6 +902,14 @@ def lsof_cwds(pids):
                 cur = None
         elif line.startswith("n") and cur is not None:
             result[cur] = line[1:]
+    if IS_LINUX:
+        for pid in pids:
+            if pid in result:
+                continue
+            try:
+                result[pid] = os.path.realpath("/proc/%d/cwd" % pid)
+            except OSError:
+                continue
     return result
 
 
@@ -819,6 +974,7 @@ _ORIGIN_SKIP_NAMES = {
     "zsh", "bash", "sh", "dash", "fish", "login", "su", "sudo", "env",
     "command", "xargs", "nohup", "setsid", "script", "expect", "caffeinate",
     "launchd",
+    "systemd", "init", "udevd", "dbus-daemon", "dbus-broker", "gnome-shell",
     "npm", "npx", "pnpm", "yarn", "corepack", "make", "just",
     "node", "tsx", "nodemon", "deno", "bun", "bunx",
     "python", "python3", "uv", "poetry", "pip", "pipx",
@@ -1475,6 +1631,7 @@ def build_launch_env(token, environ=None):
 
     Finder/LSUIElement 启动的应用通常只有系统 PATH，不会读取用户 shell 配置；
     因此显式补入 Homebrew、npm/pnpm、Volta、NVM、fnm 等常见目录。
+    Linux 上补充 cargo、conda、snap 与 ~/.local/bin 等，保证 node/npm 可用。
     """
     env = dict(os.environ if environ is None else environ)
     home = os.path.expanduser("~")
@@ -1484,8 +1641,16 @@ def build_launch_env(token, environ=None):
         os.path.join(home, ".bun", "bin"),
         os.path.join(home, "Library", "pnpm"),
         os.path.join(home, ".asdf", "shims"),
+        os.path.join(home, ".cargo", "bin"),
+        os.path.join(home, "miniconda3", "bin"),
+        os.path.join(home, "anaconda3", "bin"),
+        os.path.join(home, ".conda", "bin"),
+        os.path.join(home, ".dotnet"),
+        os.path.join(home, ".dotnet", "tools"),
         "/opt/homebrew/bin", "/opt/homebrew/sbin",
         "/usr/local/bin", "/usr/local/sbin",
+        "/usr/lib/dotnet", "/usr/share/dotnet", "/usr/local/share/dotnet",
+        "/snap/bin", "/var/lib/snapd/snap/bin",
     ]
     preferred.extend(sorted(
         glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
@@ -1499,8 +1664,37 @@ def build_launch_env(token, environ=None):
     env["PATH"] = os.pathsep.join(
         path for path in preferred if path and not (path in seen or seen.add(path)))
     env.setdefault("PNPM_HOME", os.path.join(home, "Library", "pnpm"))
+    _ensure_dotnet_env(env, home)
     env[RUN_TOKEN_ENV] = token
     return env
+
+
+def _ensure_dotnet_env(env, home):
+    """确保常见 .NET 安装位置的 DOTNET_ROOT 与 PATH 可用。
+
+    framework-dependent 的 apphost 直接运行时会依赖 DOTNET_ROOT 定位运行时；
+    dotnet CLI 需要其 bin 目录在 PATH。这里只探测真实存在的位置，不猜测版本。
+    """
+    roots = [os.path.join(home, ".dotnet"), "/usr/lib/dotnet",
+             "/usr/share/dotnet", "/usr/local/share/dotnet"]
+    # 优先使用当前 PATH 里能找到的 dotnet（可能是任意安装方式）。
+    existing_root = None
+    dotnet_path = shutil.which("dotnet", path=env.get("PATH") or None)
+    if dotnet_path:
+        existing_root = os.path.dirname(os.path.realpath(dotnet_path))
+    candidates = ([existing_root] if existing_root else []) + roots
+    for root in candidates:
+        if not root or not os.path.isfile(os.path.join(root, "dotnet")):
+            continue
+        env.setdefault("DOTNET_ROOT", root)
+        env.setdefault("DOTNET_ROOT_X64", root)
+        if root not in env.get("PATH", "").split(os.pathsep):
+            env["PATH"] = root + os.pathsep + env["PATH"]
+        return
+    # 即便找不到 dotnet，也保留常见路径在 PATH 里，避免误报 missing runtime。
+    for root in roots:
+        if os.path.isdir(root) and root not in env.get("PATH", "").split(os.pathsep):
+            env["PATH"] = root + os.pathsep + env["PATH"]
 
 
 def start_app(app):
@@ -1633,7 +1827,7 @@ def stop_app_for_update(cfg, app, timeout=5.0):
     return ok, error, bool(ok)
 
 
-def pick_path(what):
+def _pick_path_macos(what):
     """macOS 原生文件/目录选择框（osascript）。返回 (path|None, canceled)。"""
     if what == "dir":
         script = 'POSIX path of (choose folder with prompt "选择工作目录")'
@@ -1647,6 +1841,75 @@ def pick_path(what):
     if r.returncode != 0:  # 用户按了取消（"User canceled."）
         return None, True
     return r.stdout.strip().rstrip("/") or None, False
+
+
+def _pick_path_tk(what):
+    """Tk 原生选择框兜底（标准库，但需要 python3-tk）。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None, False
+    holder = {}
+
+    def _run():
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            if what == "dir":
+                holder["p"] = filedialog.askdirectory(parent=root, title="选择工作目录")
+            else:
+                holder["p"] = filedialog.askopenfilename(parent=root, title="选择批处理脚本")
+        except Exception:
+            holder["p"] = None
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(300)
+    path = holder.get("p")
+    if path:
+        return path.rstrip("/") or None, False
+    return None, True
+
+
+def _pick_path_linux(what):
+    """Linux 原生选择框：Zenity > KDialog > Tk。返回 (path|None, canceled)。"""
+    title = "选择工作目录" if what == "dir" else "选择批处理脚本"
+    if shutil.which("zenity"):
+        args = ["zenity", "--file-selection"]
+        if what == "dir":
+            args.append("--directory")
+        else:
+            args += ["--file-filter=脚本 | *.py *.sh *.bash *.zsh *.command *.js",
+                     "--file-filter=所有文件 | *"]
+        args.append("--title=%s" % title)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        except Exception:
+            return None, False
+        if r.returncode == 0:
+            return r.stdout.strip().rstrip("/") or None, False
+        return None, True  # 取消
+    if shutil.which("kdialog"):
+        try:
+            args = (["kdialog", "--getexistingdirectory", os.path.expanduser("~")]
+                    if what == "dir" else
+                    ["kdialog", "--getopenfilename", os.path.expanduser("~")])
+            r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        except Exception:
+            return None, False
+        if r.returncode == 0:
+            return r.stdout.strip().rstrip("/") or None, False
+        return None, True
+    return _pick_path_tk(what)
+
+
+def pick_path(what):
+    """跨平台文件/目录选择框。返回 (path|None, canceled)；取消不是错误。"""
+    if IS_MACOS:
+        return _pick_path_macos(what)
+    return _pick_path_linux(what)
 
 
 def command_for_script(path):
@@ -1895,6 +2158,27 @@ def _package_default_port(script_name, command, dependencies):
     return None
 
 
+def _dotnet_project_port(root):
+    """从 launchSettings.json 的 applicationUrl 提取开发端口（无则 None）。
+
+    只读取文件、不执行项目代码；多个 profile 端口取最小值，避免二义性。
+    """
+    text = _read_project_text(root, os.path.join("Properties", "launchSettings.json"))
+    if text is None:
+        text = _read_project_text(root, "launchSettings.json")  # 非标准位置兜底
+    if text is None:
+        return None
+    ports = set()
+    for m in re.finditer(r"applicationUrl\"?\s*:\s*[\"']([^\"']+)[\"']", text):
+        for url in m.group(1).split(";"):
+            pm = re.search(r":(\d{1,5})(?=/|$)", url.strip())
+            if pm:
+                port = int(pm.group(1))
+                if 1 <= port <= 65535:
+                    ports.add(port)
+    return min(ports) if ports else None
+
+
 def detect_project(root):
     """只读分析项目根目录，返回可由启动台直接使用的启动候选。"""
     if not isinstance(root, str) or not root.strip():
@@ -2084,6 +2368,25 @@ def detect_project(root):
     if os.path.isfile(os.path.join(root, "Cargo.toml")):
         note_file("Cargo.toml")
         add("cargo run", "Rust 项目", "Cargo.toml", None, 61)
+
+    # .NET / C# 项目：用 dotnet run（与终端一致），不要直接跑 bin/ 下的 apphost 二进制，
+    # 否则框架依赖的应用找不到运行时（DOTNET_ROOT 未设置）会报 “You must install .NET”。
+    dotnet_port = _dotnet_project_port(root)
+    csproj = None
+    try:
+        csproj = next((name for name in os.listdir(root)
+                       if name.endswith(".csproj")), None)
+    except OSError:
+        csproj = None
+    has_dotnet = bool(csproj or os.path.isfile(os.path.join(root, "Program.cs"))
+                      or os.path.isfile(os.path.join(root, "appsettings.json")))
+    if has_dotnet:
+        if csproj:
+            note_file(csproj)
+        else:
+            note_file("Program.cs")
+        add("dotnet run", ".NET 项目", csproj or "Program.cs", dotnet_port, 62,
+            "与终端 dotnet run 等价；不要直接运行 bin/ 下的可执行文件")
 
     for script_name in ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"):
         if os.path.isfile(os.path.join(root, script_name)):
@@ -3848,7 +4151,39 @@ def find_console_instances():
     return sorted(result, key=lambda item: (item["ports"] or [65536], item["pid"]))
 
 
+def _launcher_dialog_linux(message):
+    """Linux 上「打开/重启/取消」三选一：Zenity > KDialog。"""
+    if shutil.which("zenity"):
+        try:
+            r = subprocess.run(
+                ["zenity", "--list", "--title=总控台",
+                 "--width=380", "--height=260",
+                 "--text=%s" % message,
+                 "--column=操作", "--column=说明", "--hide-column=2",
+                 "--print-column=1",
+                 "打开控制台", "打开已运行的控制台",
+                 "重新启动", "停止并重启控制台",
+                 "取消", "不操作"],
+                capture_output=True, text=True, timeout=180)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+    if shutil.which("kdialog"):
+        try:
+            r = subprocess.run(
+                ["kdialog", "--title=总控台", "--menu=%s" % message,
+                 "打开控制台", "打开已运行的控制台",
+                 "重新启动", "停止并重启控制台"],
+                capture_output=True, text=True, timeout=180)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+    return None
+
+
 def _launcher_dialog(message):
+    if not IS_MACOS:
+        return _launcher_dialog_linux(message)
     script = """on run argv
 set messageText to item 1 of argv
 display dialog messageText with title "总控台" buttons {"取消", "重新启动", "打开控制台"} default button "打开控制台" cancel button "取消" with icon note
@@ -3863,7 +4198,27 @@ end run"""
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _launcher_alert_linux(message):
+    """Linux 弹窗提示（Zenity > KDialog）。"""
+    if shutil.which("zenity"):
+        try:
+            subprocess.run(["zenity", "--error", "--title=总控台",
+                            "--text=%s" % message], capture_output=True,
+                           timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif shutil.which("kdialog"):
+        try:
+            subprocess.run(["kdialog", "--error", message],
+                           capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def _launcher_alert(message):
+    if not IS_MACOS:
+        _launcher_alert_linux(message)
+        return
     script = """on run argv
 display alert "总控台" message (item 1 of argv) as critical
 end run"""

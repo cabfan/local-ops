@@ -2,11 +2,11 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个面向 macOS 的本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 标准库提供只绑定回环地址的后端；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个面向 macOS 与 Linux 的本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 标准库提供只绑定回环地址的后端；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
-> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
+> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。Linux 上以源码 + `start.sh` 运行，提供 `tools/install-linux.sh` 生成桌面入口。
 
-总控台只服务当前 Mac 和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+总控台只服务当前机器和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
 ## 维护说明
 
@@ -35,9 +35,9 @@
 
 ## 系统要求
 
-- macOS 12 或更高版本。
+- macOS 12 或更高版本；或 Linux（`x86_64` / `aarch64`，带 `/proc` 与桌面环境）。
 - Python 3.12。运行时仅使用 Python 标准库。
-- macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
+- macOS：系统自带的 `ps`、`lsof`、`osascript`；Linux：`ps` 与 `lsof`（缺失时自动回落到 `/proc`），选择框优先用 `zenity` / `kdialog`（兜底 Tk）。
 - Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
@@ -86,6 +86,25 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 **实际地址在哪里看**：顶栏「重启 :9600」按钮上直接显示当前端口；或看终端输出 / `~/Library/Logs/总控台/console.log`。浏览器手动访问 `http://127.0.0.1:端口号/` 即可。
 
 **停止与重启**：顶栏「重启 / 停止」控制的是总控台自身（网页服务）。停止总控台**不会**停止启动台里已经运行的应用——它们是独立进程组，会继续运行；下次打开总控台时会自动重新识别。重启总控台会加载磁盘上的最新代码，同样不影响运行中的应用。
+
+### Linux 运行
+
+Linux 上用脚本启动，等价于 macOS 的 `start.command`：
+
+```bash
+chmod +x start.sh
+./start.sh                  # 前台运行，自动打开浏览器
+```
+
+`start.sh` 会检测桌面工具：若已安装 `zenity`/`kdialog`，则以 `--launcher` 启动（已在运行时弹「打开控制台 / 重新启动 / 取消」）；否则普通启动，进程锁会自动去重并打开浏览器。
+
+如需把总控台加入应用菜单：
+
+```bash
+./tools/install-linux.sh    # 生成 ~/.local/share/applications/总控台.desktop 与图标
+```
+
+安装后可在系统应用菜单搜索「总控台」打开。命令行参数、环境变量与 macOS 一致，见下文“数据、隐私与备份”。
 
 ## 使用
 
@@ -136,14 +155,14 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 
 ## 数据、隐私与备份
 
-运行数据与程序目录分离，默认放在 macOS 用户资料库：
+运行数据与程序目录分离。macOS 默认放在用户资料库；Linux 遵循 XDG 规范：
 
-| 路径 | 内容 | 备份建议 |
+| 用途 | macOS 默认路径 | Linux 默认路径 |
 | --- | --- | --- |
-| `~/Library/Application Support/总控台/config.json` | 应用命令、本地路径、端口、标记和运行识别信息 | 必须 |
-| `~/Library/Application Support/总控台/config.json.bak` | 上一份已知良好的配置 | 必须 |
-| `~/Library/Application Support/总控台/icons/` | 用户上传的图标和站点图标 | 按需 |
-| `~/Library/Logs/总控台/` | 应用与总控台运行日志 | 通常不需 |
+| 配置 | `~/Library/Application Support/总控台/config.json` | `$XDG_DATA_HOME/总控台/config.json`（默认 `~/.local/share/总控台/`） |
+| 配置备份 | `~/Library/Application Support/总控台/config.json.bak` | `$XDG_DATA_HOME/总控台/config.json.bak` |
+| 图标 | `~/Library/Application Support/总控台/icons/` | `$XDG_DATA_HOME/总控台/icons/` |
+| 日志 | `~/Library/Logs/总控台/` | `$XDG_STATE_HOME/总控台/`（默认 `~/.local/state/总控台/`） |
 
 目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
 

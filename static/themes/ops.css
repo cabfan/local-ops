@@ -18,8 +18,12 @@
   color-scheme: light;
 
   --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text',
-    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-  --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    'Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei',
+    'Ubuntu Sans', 'DejaVu Sans', system-ui, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas,
+    'Noto Sans Mono', 'DejaVu Sans Mono', 'Ubuntu Mono', 'Source Code Pro',
+    monospace;
 
   --room: #eef2f6;        /* 雾灰底 */
   --card: #ffffff;

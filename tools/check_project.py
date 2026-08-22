@@ -394,14 +394,18 @@ def check_javascript_bindings() -> str:
 def check_shell_and_plist() -> str:
     shell_files = (
         ROOT / "start.command",
+        ROOT / "start.sh",
         ROOT / "总控台.app" / "Contents" / "MacOS" / "launcher",
+        ROOT / "tools" / "install-linux.sh",
     )
     for path in shell_files:
         command_output(["/bin/bash", "-n", str(path)])
         require(os.access(path, os.X_OK), f"{path.relative_to(ROOT)} 没有可执行权限")
-    plutil = shutil.which("plutil") or "/usr/bin/plutil"
-    command_output([plutil, "-lint", str(INFO_PLIST)])
-    return "2 个启动脚本 + Info.plist"
+    # Info.plist 校验依赖 macOS 的 plutil；其他平台下跳过（不存在该工具）。
+    plutil = shutil.which("plutil")
+    if plutil is not None:
+        command_output([plutil, "-lint", str(INFO_PLIST)])
+    return "3 个启动脚本 + Info.plist"
 
 
 def check_dev_requirements() -> str:
@@ -554,10 +558,11 @@ def check_javascript_tests() -> str:
     files = sorted(str(path) for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     require(bool(files), "tests/js/ 下没有 .test.mjs 测试文件")
     output = command_output([node, "--test", *files])
-    match = re.search(r"# (pass)\s+(\d+)", output)
+    # node 不同版本的 TAP 输出用 "ℹ pass" 或 "# pass"，均接受。
+    match = re.search(r"(?:#\s*|ℹ\s*)pass\s+(\d+)", output)
     require(match is not None, "无法确认 node --test 结果")
-    passed = int(match.group(2))
-    require("# fail" not in output or re.search(r"# fail\s+0$", output, re.M),
+    passed = int(match.group(1))
+    require(re.search(r"(?:#\s*|ℹ\s*)fail\s+0(?:\s|$)", output, re.M),
             "JavaScript 测试存在失败项")
     return f"{passed} 个测试"
 
