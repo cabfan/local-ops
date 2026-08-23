@@ -154,6 +154,10 @@ class DotnetTests(unittest.TestCase):
 class WindowsScanTests(unittest.TestCase):
     """Windows 平台解析器（用模拟命令输出在 Linux 上验证）。"""
 
+    def setUp(self):
+        # 模块级真实 cwd 缓存会跨用例共享，清空以保证隔离。
+        server._WIN_CWD_CACHE.clear()
+
     def test_parse_netstat_listeners(self):
         out = (
             "  Proto  Local Address          Foreign Address        State           PID\n"
@@ -176,16 +180,68 @@ class WindowsScanTests(unittest.TestCase):
         mem_csv = (
             '"Id","CPU","WorkingSet"\n'
             '"123","12.5","104857600"\n"234","0.75","52428800"\n')
+        # 总物理内存 = 100 MB（104857600 B），保证 pid123 的 mem 恰为 100.0%；
+        # 固定 now=1700001000 使 pid123 etime=1000s，cpu% = 12.5/1000*100 = 1.25。
+        totalmem = "104857600\n"
+        server._WINDOWS_TOTAL_MEM_BYTES = None
         with mock.patch.object(server, "run_cmd",
-                               side_effect=[proc_csv, mem_csv]):
+                               side_effect=[proc_csv, totalmem, mem_csv]), \
+                mock.patch.object(server.time, "time", return_value=1700001000.0):
             snap = server._ps_snapshot_windows()
         self.assertIn(123, snap)
         self.assertEqual(snap[123]["comm"], "node.exe")
         self.assertEqual(snap[123]["args"], "node server.js")
-        self.assertEqual(snap[123]["cpu"], 12.5)
+        self.assertEqual(snap[123]["exe"], "")  # CSV 缺 ExecutablePath 列 → 空串
+        self.assertEqual(snap[123]["cpu"], 1.25)
         self.assertEqual(snap[123]["mem"], 100.0)
         self.assertEqual(snap[123]["uid"], server.SELF_UID)
-        self.assertGreaterEqual(snap[123]["etime"], 0)
+        self.assertEqual(snap[123]["etime"], 1000)
+        self.assertEqual(snap[234]["cpu"], 0.08)
+        self.assertEqual(snap[234]["mem"], 50.0)
+
+    def test_windows_system_processes_classified_background(self):
+        # Windows 系统进程（按其可执行文件位于 \\Windows\\ 下、或以系统进程基名
+        # 兜底）应归入 background，不再挤占「我的服务」；开发/用户进程仍为 mine。
+        with mock.patch.object(server, "IS_WINDOWS", True):
+            self.assertEqual(
+                server.classify_group(
+                    "svchost.exe:135", "svchost.exe", "svchost.exe",
+                    "C:\\Windows\\System32\\svchost.exe -k netsvcs", None,
+                    set(), "C:\\Windows\\System32\\svchost.exe"),
+                "background")
+            # 取不到可执行路径的内核/系统进程按名兜底
+            self.assertEqual(
+                server.classify_group("System:80", "System", "System", "",
+                                      None, set(), ""),
+                "background")
+            self.assertEqual(
+                server.classify_group("winlogon.exe:88", "winlogon.exe",
+                                      "winlogon.exe", "", None, set(), ""),
+                "background")
+            # 开发/用户进程仍归 mine
+            self.assertEqual(
+                server.classify_group(
+                    "node.exe:3000", "node.exe", "node.exe",
+                    "C:\\Users\\x\\app\\node.exe srv.js", None, set(),
+                    "C:\\Users\\x\\app\\node.exe"),
+                "mine")
+            self.assertEqual(
+                server.classify_group(
+                    "mysqld.exe:3306", "mysqld.exe", "mysqld.exe",
+                    "C:\\Program Files\\MySQL\\mysqld.exe", None, set(),
+                    "C:\\Program Files\\MySQL\\mysqld.exe"),
+                "mine")
+
+    def test_windows_origin_snapshot_uses_cim(self):
+        # Windows 无 ps：origin_snapshot 走 Win32_Process 取 (ppid, cmdline)。
+        csv = ('"ProcessId","ParentProcessId","Name","CommandLine","ExecutablePath","EpochStart"\n'
+               '"10","1","node.exe","node srv","C:\\node\\node.exe","1700000000"\n'
+               '"20","10","node.exe","node child","C:\\node\\node.exe","1700000001"\n')
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "run_cmd", return_value=csv):
+            table = server.origin_snapshot()
+        self.assertEqual(table[10], (1, "node srv"))
+        self.assertEqual(table[20], (10, "node child"))
 
     def test_windows_pgid_map_is_process_tree(self):
         proc_csv = (
@@ -200,12 +256,22 @@ class WindowsScanTests(unittest.TestCase):
         self.assertEqual(set(groups[300]), {300})
 
     def test_windows_cwds_uses_exec_dir(self):
-        # 注意：在 Linux 上 os.path.realpath 把反斜杠当普通字符，因而用平台无关
-        # 的绝对路径来验证「取可执行文件所在目录」的逻辑。
+        # PEB 取不到真实 cwd 时，退回「可执行文件所在目录」。注意：在 Linux 上
+        # os.path.realpath 把反斜杠当普通字符，因而用平台无关的绝对路径验证。
         csv = '"ProcessId","ExecutablePath"\n"123","/opt/node/node.exe"\n'
         with mock.patch.object(server, "run_cmd", return_value=csv):
             got = server._lsof_cwds_windows([123])
         self.assertEqual(got[123], os.path.dirname("/opt/node/node.exe"))
+
+    def test_windows_cwds_prefers_real_cwd(self):
+        # 真实工作目录（PEB）优先；取不到的 pid 退回 exe 目录。
+        with mock.patch.object(server, "_windows_real_cwd",
+                               return_value={123: r"D:\real\cwd"}), \
+                mock.patch.object(server, "_exe_dir_cwds_windows",
+                                  return_value={124: r"D:\exe2"}):
+            got = server._lsof_cwds_windows([123, 124])
+        self.assertEqual(got[123], r"D:\real\cwd")
+        self.assertEqual(got[124], r"D:\exe2")
 
     def test_windows_scan_listeners_dispatch(self):
         with mock.patch.object(server, "IS_WINDOWS", True), \

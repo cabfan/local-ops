@@ -736,7 +736,7 @@ def _to_float(tok, default=0.0):
 
 _WIN_PROCESS_CSV = (
     "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-    "Select-Object ProcessId,ParentProcessId,Name,CommandLine,"
+    "Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,"
     "@{n='EpochStart';e={[int64](($_.CreationDate - [datetime]'1970-01-01').TotalSeconds)}} | "
     "ConvertTo-Csv -NoTypeInformation")
 _WIN_MEM_CSV = (
@@ -800,12 +800,53 @@ def _scan_listeners_windows():
     return _parse_netstat_listeners(run_cmd(["netstat", "-ano", "-p", "tcp"]))
 
 
+_WINDOWS_TOTAL_MEM_BYTES = None
+
+
+def _windows_total_physical_memory():
+    """Windows 总物理内存（字节），查询一次后缓存；失败返回 0。
+
+    与 _ps_snapshot_windows 里的 Win32_Process 一样走 Get-CimInstance，属同类权限；
+    只有取到大于 0 的值才缓存，避免偶发失败后永久停在 0。
+    """
+    global _WINDOWS_TOTAL_MEM_BYTES
+    if _WINDOWS_TOTAL_MEM_BYTES:
+        return _WINDOWS_TOTAL_MEM_BYTES
+    out = run_cmd(
+        _ps_command("(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"))
+    value = 0
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            value = int(line)
+            break
+    if value > 0:
+        _WINDOWS_TOTAL_MEM_BYTES = value
+    return value
+
+
+def _windows_cpu_pct(cpu_seconds, etime_seconds):
+    """累计 CPU 秒 / 运行秒 → 百分比（≈ ps %cpu 进程自启动以来均值）。
+
+    Get-Process 的 .CPU 是运行以来的 CPU 总秒数；换算成比例后与 macOS/Linux
+    的 ps %cpu 语义一致，避免把秒数直接当成百分比。
+    """
+    try:
+        cpu_seconds = float(cpu_seconds or 0)
+        etime_seconds = float(etime_seconds or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if etime_seconds <= 0:
+        return 0.0
+    return (cpu_seconds / etime_seconds) * 100.0
+
+
 def _ps_snapshot_windows(pids=None):
     """Windows 进程快照 → {pid: {uid, comm, args, cpu, mem, etime}}。
 
     uid 统一为 SELF_UID（Windows 无 uid；tasklist 会话即当前用户）。
-    args 取自 Win32_Process.CommandLine，供 run-token 校验；cpu 用 CPU 秒、
-    mem 用工作集 MB（近似），etime 由创建时间推导。
+    args 取自 Win32_Process.CommandLine，供 run-token 校验；cpu/mem 换算成
+    百分比（与 ps %cpu/%mem 一致），etime 由创建时间推导。
     """
     now = time.time()
     snap = {}
@@ -819,10 +860,12 @@ def _ps_snapshot_windows(pids=None):
             "uid": SELF_UID,
             "comm": str(row.get("Name") or ""),
             "args": str(row.get("CommandLine") or ""),
+            "exe": str(row.get("ExecutablePath") or ""),
             "cpu": 0.0,
             "mem": 0.0,
             "etime": max(0, int(now - epoch)) if epoch is not None else 0,
         }
+    total_mem = _windows_total_physical_memory()
     for row in _csv_rows(run_cmd(_ps_command(_WIN_MEM_CSV))):
         try:
             pid = int(row.get("Id"))
@@ -830,13 +873,21 @@ def _ps_snapshot_windows(pids=None):
             continue
         if pid not in snap:
             continue
+        # Get-Process .CPU 是运行以来的累计 CPU 秒数，需除以该进程已运行秒数
+        # 才得到百分比（否则会把秒数当成 %）。
         try:
-            snap[pid]["cpu"] = round(_to_float(row.get("CPU")), 2)
+            snap[pid]["cpu"] = round(
+                _windows_cpu_pct(_to_float(row.get("CPU")), snap[pid]["etime"]), 2)
         except (TypeError, ValueError):
             pass
+        # Get-Process .WorkingSet 是字节数，需除以总物理内存才得到百分比
+        # （否则会把工作集 MB 当成 %，导致 >100% 的假数据）。
         try:
-            snap[pid]["mem"] = round(
-                _to_float(row.get("WorkingSet")) / (1024.0 * 1024.0), 2)
+            ws = _to_float(row.get("WorkingSet"))
+            if total_mem > 0:
+                snap[pid]["mem"] = round((ws / total_mem) * 100.0, 2)
+            else:
+                snap[pid]["mem"] = 0.0
         except (TypeError, ValueError):
             pass
     if pids is not None:
@@ -845,11 +896,94 @@ def _ps_snapshot_windows(pids=None):
     return snap
 
 
-def _lsof_cwds_windows(pids):
-    """Windows 尽力取「cwd」：用可执行文件所在目录作为较低置信度的工作目录。
+# Windows 进程真实 cwd 采集（PEB）。
+# Windows 没有通用 cwd API；可执行文件目录只是低置信度估计（node 会在 nvm 目录）。
+# 这里用 PowerShell P/Invoke 读 PEB 的 ProcessParameters.CurrentDirectory.DosPath，
+# 结果按 pid 缓存（Add-Type 有编译开销），只对未缓存的新 pid 查询一次。
+_WIN_CWD_CACHE = {}  # pid -> 真实 cwd；'' 表示已查过但取不到（用 exe 目录兜底）
 
-    Windows 没有可靠的 cwd API；返回空目录时不匹配，避免错误关联。
+_WIN_PEB_CWD_PS = r'''
+$ErrorActionPreference = 'Stop'
+$sig = @'
+using System;
+using System.Runtime.InteropServices;
+public class P {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct PROCESS_BASIC_INFORMATION {
+    public IntPtr Reserved1; public IntPtr PebBaseAddress;
+    public IntPtr Reserved2_0; public IntPtr Reserved2_1;
+    public IntPtr UniqueProcessId; public IntPtr Reserved3;
+  }
+  [DllImport("ntdll.dll")] public static extern int NtQueryInformationProcess(IntPtr hProcess, int infoClass, ref PROCESS_BASIC_INFORMATION pbi, int cb, out int returnLength);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out int read);
+}
+'@
+Add-Type $sig
+function Get-ProcCwd([int]$procId) {
+  $h = [P]::OpenProcess(0x0010 -bor 0x0400, $false, $procId)
+  if ($h -eq [IntPtr]::Zero) { return $null }
+  try {
+    $pbi = New-Object P+PROCESS_BASIC_INFORMATION
+    $len = 0
+    $r = [P]::NtQueryInformationProcess($h, 0, [ref]$pbi, [System.Runtime.InteropServices.Marshal]::SizeOf($pbi), [ref]$len)
+    if ($r -ne 0) { return $null }
+    $is64 = ([IntPtr]::Size -eq 8)
+    $ppOff = if ($is64) { 0x20 } else { 0x10 }
+    $read = 0; $b = New-Object byte[] 8
+    [P]::ReadProcessMemory($h, [IntPtr]::Add($pbi.PebBaseAddress, $ppOff), $b, 8, [ref]$read) | Out-Null
+    $pp = [IntPtr][BitConverter]::ToInt64($b,0)
+    if ($pp -eq [IntPtr]::Zero) { return $null }
+    $curOff = if ($is64) { 0x38 } else { 0x24 }
+    $us = New-Object byte[] 16
+    [P]::ReadProcessMemory($h, [IntPtr]::Add($pp, $curOff), $us, 16, [ref]$read) | Out-Null
+    if ($read -ne 16) { return $null }
+    $strLen = [BitConverter]::ToUInt16($us, 0)
+    $bufPtr = if ($is64) { [IntPtr][BitConverter]::ToInt64($us, 8) } else { [IntPtr][BitConverter]::ToUInt32($us, 4) }
+    if ($strLen -le 0 -or $strLen -gt 1024 -or $bufPtr -eq [IntPtr]::Zero) { return $null }
+    $sbytes = New-Object byte[] $strLen
+    $r2 = 0
+    [P]::ReadProcessMemory($h, $bufPtr, $sbytes, $strLen, [ref]$r2) | Out-Null
+    if ($r2 -ne $strLen) { return $null }
+    return [System.Text.Encoding]::Unicode.GetString($sbytes, 0, $r2).TrimEnd('\')
+  } finally { [P]::CloseHandle($h) | Out-Null }
+}
+$procIds = __PIDS__
+foreach ($procId in $procIds) {
+  $c = Get-ProcCwd $procId
+  if ($c) { Write-Output ($procId.ToString() + "`t" + $c) }
+}
+'''
+
+
+def _windows_real_cwd(pids):
+    """批量读 Windows 进程真实 cwd（PEB），只查询未缓存 pid，结果按 pid 缓存。
+
+    返回 {pid: cwd}（仅含成功读到的）。读取失败的 pid 以 '' 缓存，避免每轮
+    轮询重复触发 PowerShell + Add-Type；这些 pid 由调用方退回 exe 目录。
     """
+    want = [int(p) for p in pids if int(p) not in _WIN_CWD_CACHE]
+    if want:
+        script = _WIN_PEB_CWD_PS.replace(
+            "__PIDS__", ",".join(str(p) for p in want))
+        out = run_cmd(_ps_command(script))
+        found = {}
+        for line in (out or "").splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[1].strip():
+                try:
+                    found[int(parts[0])] = parts[1].strip()
+                except ValueError:
+                    continue
+        for p in want:
+            _WIN_CWD_CACHE[p] = found.get(p, "")
+    wanted = {int(x) for x in pids}
+    return {p: c for p, c in _WIN_CWD_CACHE.items() if p in wanted and c}
+
+
+def _exe_dir_cwds_windows(pids):
+    """退回落：可执行文件所在目录作为低置信度工作目录。"""
     pids = [int(p) for p in pids]
     if not pids:
         return {}
@@ -870,6 +1004,20 @@ def _lsof_cwds_windows(pids):
                 result[pid] = os.path.dirname(os.path.realpath(exe))
             except OSError:
                 continue
+    return result
+
+
+def _lsof_cwds_windows(pids):
+    """Windows 尽力取「cwd」：优先读 PEB 的真实工作目录，取不到再退回可执行
+    文件所在目录（旧行为）。返回空目录时不匹配，避免错误关联。"""
+    pids = [int(p) for p in pids]
+    if not pids:
+        return {}
+    real = _windows_real_cwd(pids)
+    missing = [p for p in pids if p not in real]
+    result = dict(real)
+    if missing:
+        result.update(_exe_dir_cwds_windows(missing))
     return result
 
 
@@ -1246,7 +1394,41 @@ DEV_KEYWORDS = (
 )
 
 
-def classify_group(key, name, comm, args, cwd, promoted):
+# Windows 系统进程的基名（ExecutablePath 可能为空/受保护，需按名兜底）。
+# 主要靠可执行文件是否位于 \\Windows\\ 下判断，这里仅覆盖取不到路径的核/系统进程。
+_WINDOWS_SYSTEM_NAMES = {
+    "system", "registry", "memcompression", "smss", "smss.exe", "csrss",
+    "csrss.exe", "wininit", "wininit.exe", "winlogon", "winlogon.exe",
+    "services", "services.exe", "lsass", "lsass.exe", "lsaiso", "lsaiso.exe",
+    "spoolsv", "spoolsv.exe", "fontdrvhost", "fontdrvhost.exe", "dwm",
+    "dwm.exe", "dllhost", "dllhost.exe", "sihost", "sihost.exe", "taskhostw",
+    "taskhostw.exe", "wudfhost", "wudfhost.exe", "searchindexer",
+    "searchindexer.exe", "werfault", "werfault.exe", "svchost", "svchost.exe",
+    "conhost", "conhost.exe", "msiexec", "msiexec.exe", "winword",
+    "winword.exe", "explorer", "explorer.exe",
+}
+
+
+def _is_windows_system_proc(name, exe, args):
+    """Windows 系统进程 → True（用于归入 background）。
+
+    POSIX 靠 SYSTEM_PATH_PREFIXES 匹配 `/usr/libexec` 等路径；Windows 的 comm
+    只有基名，因此改用可执行文件是否位于 ``\\Windows\\`` 下，再用已知系统进程
+    基名兜底（部分受保护进程 ExecutablePath 为空）。
+    """
+    if name.lower() in _WINDOWS_SYSTEM_NAMES:
+        return True
+    exe_low = (exe or "").lower()
+    if exe_low and ("\\windows\\" in exe_low or exe_low.startswith("c:\\windows")):
+        return True
+    if not exe_low and args:
+        args_low = args.lower()
+        if "\\windows\\" in args_low or args_low.startswith("c:\\windows"):
+            return True
+    return False
+
+
+def classify_group(key, name, comm, args, cwd, promoted, exe=None):
     if key in promoted:
         return "mine"
     text = name.lower()
@@ -1257,6 +1439,8 @@ def classify_group(key, name, comm, args, cwd, promoted):
     if comm.startswith(SYSTEM_PATH_PREFIXES):
         return "background"
     if "/Library/Containers/" in comm or "/Library/Containers/" in (cwd or ""):
+        return "background"
+    if IS_WINDOWS and _is_windows_system_proc(name, exe, args):
         return "background"
     return "mine"
 
@@ -1340,8 +1524,21 @@ _ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
 
 
 def origin_snapshot():
-    """ps -axo pid=,ppid=,args → {pid: (ppid, args)}，供来源溯源。"""
+    """{pid: (ppid, args)}，供来源溯源。
+
+    macOS/Linux 用 ``ps -axo pid=,ppid=,args``；Windows 没有 ps，改读
+    Win32_Process（ProcessId, ParentProcessId, CommandLine）。
+    """
     table = {}
+    if IS_WINDOWS:
+        for row in _csv_rows(run_cmd(_ps_command(_WIN_PROCESS_CSV))):
+            try:
+                pid = int(row.get("ProcessId"))
+                ppid = int(row.get("ParentProcessId"))
+            except (TypeError, ValueError):
+                continue
+            table[pid] = (ppid, str(row.get("CommandLine") or ""))
+        return table
     for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
         toks = line.split(None, 2)
         if len(toks) < 2:
@@ -1437,7 +1634,8 @@ def build_services(cfg, groups=None):
             "openHost": listener_open_host(listeners, port, {pid}),
             "cwd": cwd, "project": project_name(cwd), "cmd": args,
             "cpu": info["cpu"], "mem": info["mem"], "uptimeSec": info["etime"],
-            "group": classify_group(key, name, comm, args, cwd, promoted),
+            "group": classify_group(key, name, comm, args, cwd, promoted,
+                                    info.get("exe")),
             "pinned": key in pinned, "hidden": key in hidden,
             "promoted": key in promoted,
             "appId": app["id"] if app else None,
@@ -3449,8 +3647,8 @@ class ConsoleServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
         exc_type, exc, _ = sys.exc_info()
-        if exc_type and isinstance(exc, (TimeoutError, BrokenPipeError,
-                                         ConnectionResetError)):
+        # ConnectionError 覆盖 BrokenPipe / ConnectionReset / ConnectionAborted(10053) 等。
+        if exc_type and isinstance(exc, (TimeoutError, ConnectionError)):
             return
         super().handle_error(request, client_address)
 
@@ -3642,7 +3840,8 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             try:
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except ConnectionError:
+                # 客户端提前断开（10053 等）属正常现象，静默忽略。
                 pass
 
     def send_json(self, obj, status=200):
