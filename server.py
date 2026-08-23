@@ -17,6 +17,7 @@ import csv
 import datetime
 import errno
 import json
+import ipaddress
 import logging
 import os
 import re
@@ -136,7 +137,32 @@ def read_project_version(path=VERSION_PATH):
 
 APP_VERSION, VERSION_LOAD_ERROR = read_project_version()
 
-HOST = "127.0.0.1"
+HOST = os.environ.get("CONSOLE_HOST", "127.0.0.1")
+# 允许通过局域网访问控制台的网段/IP，逗号分隔，支持 CIDR（如 "192.168.1.0/24"）。
+# 默认空 = 仅允许本机回环（与旧行为一致）；显式设置后才放开非回环访问。
+CONSOLE_LAN_ALLOW = [x.strip() for x in os.environ.get("CONSOLE_LAN_ALLOW", "").split(",") if x.strip()]
+
+
+def _ip_in_lan_allow(ip):
+    """客户端 IP 是否命中局域网白名单（CONSOLE_LAN_ALLOW）。"""
+    if not CONSOLE_LAN_ALLOW:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for entry in CONSOLE_LAN_ALLOW:
+        if "/" in entry:
+            try:
+                if addr in ipaddress.ip_network(entry, strict=False):
+                    return True
+            except ValueError:
+                continue
+        elif str(addr) == entry:
+            return True
+    return False
+
+
 PORT_START = 9600
 PORT_TRIES = 10
 SUBPROCESS_TIMEOUT = 5          # lsof/ps 等子进程超时（秒）
@@ -3490,7 +3516,8 @@ class Handler(BaseHTTPRequestHandler):
             port = parsed.port
         except (ValueError, UnicodeError):
             return None
-        if hostname not in ("127.0.0.1", "localhost", "::1"):
+        if not (hostname in ("127.0.0.1", "localhost", "::1")
+                or _ip_in_lan_allow(self.client_address[0])):
             return None
         if port != self.server.console_port:
             return None
@@ -3500,7 +3527,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._parsed_request_host() is None:
             return False
         try:
-            return self.client_address[0] in ("127.0.0.1", "::1")
+            client_ip = self.client_address[0]
+            return client_ip in ("127.0.0.1", "::1") or _ip_in_lan_allow(client_ip)
         except (AttributeError, IndexError):
             return False
 
