@@ -1072,7 +1072,9 @@ class ConsoleRestartTests(unittest.TestCase):
 
         fake_server = FakeServer()
         fake_proc = mock.Mock(pid=72001)
-        with mock.patch.object(server.subprocess, "Popen", return_value=fake_proc) as popen, \
+        with mock.patch.object(
+                server, "_is_console_systemd_service", return_value=False), \
+                mock.patch.object(server.subprocess, "Popen", return_value=fake_proc) as popen, \
                 mock.patch.object(server.time, "sleep", return_value=None):
             helper_pid = server.schedule_console_restart(fake_server, 9603)
             self.assertTrue(fake_server.stopped.wait(1))
@@ -1080,6 +1082,46 @@ class ConsoleRestartTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertIn("--restart-helper", command)
         self.assertEqual(command[-1], "9603")
+
+    def test_panel_restart_uses_systemd_user_service_when_active(self):
+        class FakeServer:
+            def shutdown(self):
+                pass
+
+        fake_server = FakeServer()
+        fake_proc = mock.Mock(pid=72002)
+        with mock.patch.object(
+                server, "_is_console_systemd_service", return_value=True), \
+                mock.patch.object(server.subprocess, "Popen",
+                                  return_value=fake_proc) as popen:
+            helper_pid = server.schedule_console_restart(fake_server, 9603)
+        self.assertEqual(helper_pid, 72002)
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command,
+            ["systemctl", "--user", "--no-block", "restart", "local-ops-console"])
+
+    def test_systemd_service_detection_requires_active_console_unit(self):
+        with mock.patch.object(server, "IS_LINUX", True), \
+                mock.patch.object(server.shutil, "which",
+                                  return_value="/usr/bin/systemctl"), \
+                mock.patch.object(server.subprocess, "run",
+                                  side_effect=[
+                                      mock.Mock(
+                                          returncode=0,
+                                          stdout="active\n"),
+                                      mock.Mock(
+                                          returncode=0,
+                                          stdout=str(server.SELF_PID) +
+                                          "\n"),
+                                  ]) as run:
+            self.assertTrue(server._is_console_systemd_service())
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [["systemctl", "--user", "show", "local-ops-console",
+              "--property=ActiveState", "--value"],
+             ["systemctl", "--user", "show", "local-ops-console",
+              "--property=MainPID", "--value"]])
 
     def test_panel_stop_shuts_down_after_response_window(self):
         class FakeServer:

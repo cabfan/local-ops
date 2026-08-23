@@ -165,6 +165,7 @@ def _ip_in_lan_allow(ip):
 
 PORT_START = 9600
 PORT_TRIES = 10
+SYSTEMD_CONSOLE_UNIT = "local-ops-console"
 SUBPROCESS_TIMEOUT = 5          # lsof/ps 等子进程超时（秒）
 MAX_ICON_BYTES = 5 * 1024 * 1024
 MAX_JSON_BYTES = 1 * 1024 * 1024
@@ -4688,8 +4689,43 @@ def launcher_main():
         raise
 
 
+def _is_console_systemd_service():
+    """当前总控台是否由 systemd 用户服务 local-ops-console 托管。"""
+    if not IS_LINUX or not shutil.which("systemctl"):
+        return False
+    try:
+        active = subprocess.run(
+            ["systemctl", "--user", "show", SYSTEMD_CONSOLE_UNIT,
+             "--property=ActiveState", "--value"],
+            capture_output=True, text=True, timeout=3)
+        main_pid = subprocess.run(
+            ["systemctl", "--user", "show", SYSTEMD_CONSOLE_UNIT,
+             "--property=MainPID", "--value"],
+            capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return (active.returncode == 0
+            and str(active.stdout).strip() == "active"
+            and main_pid.returncode == 0
+            and str(main_pid.stdout).strip() == str(SELF_PID))
+
+
 def schedule_console_restart(server, preferred_port):
-    """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
+    """重启总控台。
+
+    Linux 上若由 systemd 用户服务 local-ops-console 托管，则让 systemd
+    接管重启（页面按钮与 systemd 配置保持一致）；Windows/macOS 或非
+    systemd 的普通启动方式继续使用原有独立 helper 原地重启。
+    """
+    if _is_console_systemd_service():
+        # 异步请求 systemd 重启当前 unit；由 systemd 负责停止旧进程并拉起新进程。
+        proc = subprocess.Popen(
+            ["systemctl", "--user", "--no-block", "restart", SYSTEMD_CONSOLE_UNIT],
+            cwd=BASE_DIR, start_new_session=True, close_fds=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return proc.pid
+
+    # 默认/Windows/macOS：启动独立 helper，响应发出后关闭当前 HTTP 服务。
     helper = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--restart-helper",
          str(SELF_PID), str(int(preferred_port))],
