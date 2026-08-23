@@ -2,7 +2,7 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个面向 macOS 与 Linux 的本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 标准库提供只绑定回环地址的后端；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个面向 macOS、Linux 与 Windows 的本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 标准库提供默认回环、可按配置开放局域网访问的后端；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
 > 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。Linux 上以源码 + `start.sh` 运行，提供 `tools/install-linux.sh` 生成桌面入口。
 
@@ -82,9 +82,16 @@ python3 server.py --no-browser        # 只启动服务，不自动打开浏览�
 python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 ```
 
-启动后程序只绑定 `127.0.0.1`，从 9600 起尝试端口，被占用则递增（最多 10 个），并自动打开浏览器。命令行参数、环境变量（`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR`）见下文“数据、隐私与备份”。
+直接运行 `python3 server.py` 时默认只绑定 `127.0.0.1`；Linux 的 `start.sh` 以及 systemd 用户服务可通过 `CONSOLE_HOST` / `CONSOLE_LAN_ALLOW` 开放局域网访问（见“局域网访问”）。默认从 9600 起尝试端口，被占用则递增（最多 10 个），并自动打开浏览器。命令行参数、环境变量（`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR` / `CONSOLE_HOST` / `CONSOLE_LAN_ALLOW`）见下文“数据、隐私与备份”。
 
-**实际地址在哪里看**：顶栏「重启 :9600」按钮上直接显示当前端口；或看终端输出 / `~/Library/Logs/总控台/console.log`。浏览器手动访问 `http://127.0.0.1:端口号/` 即可。
+**实际地址在哪里看**：顶栏「重启 :9600」按钮上直接显示当前端口；或看终端输出及对应平台日志（macOS：`~/Library/Logs/总控台/console.log`；Linux：`~/.local/state/总控台/console.log`；Windows：`%LOCALAPPDATA%/总控台/logs/console.log`）。浏览器手动访问 `http://127.0.0.1:端口号/` 即可。
+
+### 局域网访问（可选）
+
+- `CONSOLE_HOST=0.0.0.0`：监听所有网卡，允许局域网访问。
+- `CONSOLE_LAN_ALLOW`：允许访问的 IP/CIDR 白名单，逗号分隔，例如 `192.168.1.0/24,10.0.0.5`。
+- `CONSOLE_LAN_ALLOW` 默认空 = 仅允许本机回环；只有显式设置白名单后才会放开非回环访问。
+- Linux 的 `start.sh` 默认使用 `CONSOLE_HOST=0.0.0.0` 和 `CONSOLE_LAN_ALLOW=192.168.1.0/24`；如需恢复仅本机，可把 `start.sh` 中的 `CONSOLE_HOST` 改回 `127.0.0.1` 并删除/清空 `CONSOLE_LAN_ALLOW`。
 
 **停止与重启**：顶栏「重启 / 停止」控制的是总控台自身（网页服务）。停止总控台**不会**停止启动台里已经运行的应用——它们是独立进程组，会继续运行；下次打开总控台时会自动重新识别。重启总控台会加载磁盘上的最新代码，同样不影响运行中的应用。
 
@@ -240,10 +247,10 @@ python3 server.py
 
 ## 安全边界
 
-总控台不是多用户服务器或远程管理面板。它能以当前 macOS 用户的权限执行你保存的 shell 命令，因此：
+总控台不是多用户服务器或远程管理面板。它能以当前系统用户（macOS/Linux/Windows）的权限执行你保存的 shell 命令，因此：
 
 - 只添加你已检查且信任的命令和工作目录。
-- 不要将服务绑定到 `0.0.0.0`，不要通过反向代理、SSH 隧道或端口映射对外暴露。
+- 若只在本机使用，请保持 `CONSOLE_HOST=127.0.0.1`、`CONSOLE_LAN_ALLOW` 为空；确需局域网访问时，请用 `CONSOLE_LAN_ALLOW` 限定可信网段/IP，并不要通过反向代理、SSH 隧道或端口映射暴露到公网。
 - 不要在共享或不受信任的用户账户中运行。
 - 不要把 Application Support 中的 `config.json`、Library Logs 日志或故障截图未经脱敏就上传。
 - 本地回环绑定只是第一层边界，不能替代写接口的 Host/Origin/控制令牌防护。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
@@ -346,7 +353,7 @@ make check
 
 | 衍生版本 | 说明 | 出处 |
 | --- | --- | --- |
-| Windows 10/11 适配（双平台运行） | 共享代码 + 平台分支收敛，不新增运行时依赖，含 Windows 专属测试与 CI | PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
+| Windows 10/11 适配（双平台运行） | 已并入本仓库 `main`；共享代码 + 平台分支收敛，不新增运行时依赖，含 Windows 专属测试与 CI | 原上游 PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
 | Windows 11 安全优先移植（Draft） | Job Objects、签名回执、CREATE_SUSPENDED 等更严格的进程所有权模型，含打包体系 | PR [#3](https://github.com/laogou717/local-ops/pull/3)（songconmaisaix31-design） |
 | Windows 后端 `server_win.py` | 独立 Windows 后端（纯标准库），复用本仓库前端 | PR [#4](https://github.com/laogou717/local-ops/pull/4)（Hexvork） |
 | sysops.py 跨平台抽象层方案 | psutil 唯一新增依赖，macOS 分支零改动，作者已在日常使用 | [Issue #1 提案](https://github.com/laogou717/local-ops/issues/1)（FL411） |
