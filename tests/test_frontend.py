@@ -307,6 +307,19 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue((ROOT / "static/assets" / name).is_file())
 
+    def test_lan_open_links_use_current_console_hostname(self):
+        """局域网访问时，端口打开链接应使用当前控制台主机名而非 127.0.0.1。"""
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "const pageHost = String(location && location.hostname || '').trim();",
+            core,
+        )
+        self.assertIn(
+            "if (!pageIsLoopback) return 'http://' + pageHost + ':' + value;",
+            core,
+        )
+        self.assertIn("bareHost === '::1'", core)
+
 
 if __name__ == "__main__":
     unittest.main()

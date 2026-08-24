@@ -52,10 +52,17 @@ export function truncateMiddle(s, max = 34) {
   const keep = max - 1;
   return s.slice(0, Math.ceil(keep / 2)) + '…' + s.slice(-Math.floor(keep / 2));
 }
-/* 后端根据真实 bind address 返回 openHost；旧后端缺字段时保持原行为。 */
+/* 后端根据真实 bind address 返回 openHost，适合本机回环访问；
+   当通过局域网地址打开总控台时，服务端口也应使用当前控制台主机名，
+   否则会跳到访问者自己机器上的 127.0.0.1。 */
 export function localServiceUrl(item, port) {
   const value = Number(port);
   if (!Number.isInteger(value) || value <= 0 || value > 65535) return '';
+  const pageHost = String(location && location.hostname || '').trim();
+  const bareHost = pageHost.replace(/^\[|\]$/g, '').toLowerCase();
+  const pageIsLoopback = !bareHost || bareHost === 'localhost' ||
+    bareHost === '127.0.0.1' || bareHost === '::1' || bareHost === '0.0.0.0';
+  if (!pageIsLoopback) return 'http://' + pageHost + ':' + value;
   let host = item && item.openHosts && item.openHosts[String(value)];
   if (!host && item) host = item.openHost;
   host = host === 'localhost' ? 'localhost' : '127.0.0.1';
