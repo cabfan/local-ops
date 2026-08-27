@@ -115,6 +115,15 @@ chmod +x start.sh
 
 安装后可在系统应用菜单搜索「总控台」打开。命令行参数、环境变量与 macOS 一致，见下文“数据、隐私与备份”。
 
+如需把总控台设为开机自启动（登录桌面后自动运行）：
+
+```bash
+./tools/install-autostart.sh             # 安装当前用户的开机自启动项
+./tools/install-autostart.sh --remove    # 移除开机自启动项
+```
+
+自启动项写入 `~/.config/autostart/总控台.desktop`。自启动时会跳过交互式 `--launcher` 选择框，已运行实例由进程锁去重并直接打开浏览器；需要仅后台启动不自动开浏览器的话，可自行把启动命令换成 `python3 server.py --no-browser`。
+
 ### Windows 运行
 
 Windows 上用脚本启动，等价于 Linux 的 `start.sh`：

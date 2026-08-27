@@ -23,7 +23,9 @@ fi
 
 # --launcher：若已在运行则弹“打开控制台 / 重新启动 / 取消”选择（需 zenity 或 kdialog）；
 # 否则退回普通启动，进程锁会自动去重并打开浏览器。
-if command -v zenity >/dev/null 2>&1 || command -v kdialog >/dev/null 2>&1; then
+# 自启动/无人值守时设置 CONSOLE_NO_LAUNCHER=1，跳过交互选择框，避免登录时弹窗。
+if [ "${CONSOLE_NO_LAUNCHER:-0}" != "1" ] && \
+   { command -v zenity >/dev/null 2>&1 || command -v kdialog >/dev/null 2>&1; }; then
   exec python3 server.py --launcher
 fi
 exec python3 server.py
