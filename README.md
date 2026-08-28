@@ -124,6 +124,20 @@ chmod +x start.sh
 
 自启动项写入 `~/.config/autostart/总控台.desktop`。自启动时会跳过交互式 `--launcher` 选择框，已运行实例由进程锁去重并直接打开浏览器；需要仅后台启动不自动开浏览器的话，可自行把启动命令换成 `python3 server.py --no-browser`。
 
+如需把总控台作为后台用户服务常驻，并让它在**重启后自动启动**：
+
+```bash
+./tools/install-systemd.sh    # 安装并启用 ~/.config/systemd/user/local-ops-console.service
+```
+
+该命令会立即启动服务并设置开机自启（同时尽可能开启 user lingering）。服务使用 `--no-browser` 后台运行，不弹出浏览器窗口；日志通过 `journalctl --user -u local-ops-console -f` 查看。默认与 `start.sh` 一致，监听 `0.0.0.0` 并允许本地网段访问；如需仅本机访问：
+
+```bash
+CONSOLE_HOST=127.0.0.1 CONSOLE_LAN_ALLOW= ./tools/install-systemd.sh
+```
+
+已在 systemd 托管下运行时，总控台页面顶栏的「重启」会调用 `systemctl --user restart local-ops-console`，不会产生脱离 systemd 的独立进程。
+
 ### Windows 运行
 
 Windows 上用脚本启动，等价于 Linux 的 `start.sh`：

@@ -398,6 +398,7 @@ def check_shell_and_plist() -> str:
         ROOT / "总控台.app" / "Contents" / "MacOS" / "launcher",
         ROOT / "tools" / "install-linux.sh",
         ROOT / "tools" / "install-autostart.sh",
+        ROOT / "tools" / "install-systemd.sh",
     )
     for path in shell_files:
         command_output(["/bin/bash", "-n", str(path)])
@@ -406,7 +407,7 @@ def check_shell_and_plist() -> str:
     plutil = shutil.which("plutil")
     if plutil is not None:
         command_output([plutil, "-lint", str(INFO_PLIST)])
-    return "5 个启动脚本 + Info.plist"
+    return "6 个启动脚本 + Info.plist"
 
 
 def check_dev_requirements() -> str:

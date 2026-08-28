@@ -7,10 +7,10 @@ cd "$(dirname "$0")"
 
 # 局域网访问配置：
 #   CONSOLE_HOST        = 绑定地址。0.0.0.0 允许局域网访问；改回 127.0.0.1 则仅本机。
-#   CONSOLE_LAN_ALLOW   = 允许访问的网段/IP（逗号分隔，支持 CIDR）。默认含 192.168.1.0/24、11.254.3.0/24 和 11.254.2.186。
+#   CONSOLE_LAN_ALLOW   = 允许访问的网段/IP（逗号分隔，支持 CIDR）。默认含 192.168.1.0/24、11.254.3.0/24、11.254.2.149 和 11.254.2.186。
 # 恢复仅本机：把两行改为 CONSOLE_HOST=127.0.0.1 并删除 CONSOLE_LAN_ALLOW。
 export CONSOLE_HOST=0.0.0.0
-export CONSOLE_LAN_ALLOW=${CONSOLE_LAN_ALLOW:-192.168.1.0/24,11.254.3.0/24,11.254.2.186}
+export CONSOLE_LAN_ALLOW=${CONSOLE_LAN_ALLOW:-192.168.1.0/24,11.254.3.0/24,11.254.2.149,11.254.2.186}
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "错误：未找到 Python 3，请先安装 Python 3.12 或更高版本。" >&2
