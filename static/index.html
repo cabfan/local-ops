@@ -39,6 +39,10 @@
         <span class="rail-ic" id="railIconLogs" aria-hidden="true"></span>
         <span class="rail-label">日志中心</span>
       </button>
+      <button class="rail-btn" id="rail-review" type="button" data-view="review" aria-label="每日代码审查">
+        <span class="rail-ic" id="railIconReview" aria-hidden="true"></span>
+        <span class="rail-label">代码审查</span>
+      </button>
       <button class="rail-btn" id="rail-settings" type="button" data-action="settings" aria-label="设置中心">
         <span class="rail-ic" id="railIconSettings" aria-hidden="true"></span>
         <span class="rail-label">设置中心</span>
@@ -81,6 +85,10 @@
           <button class="nav-btn" id="tab-logs" type="button" role="tab" aria-selected="false" aria-controls="view-logs" tabindex="-1" data-view="logs">
             <span class="nav-ic" id="navIconLogs" aria-hidden="true"></span>
             <span class="nav-label">日志中心</span>
+          </button>
+          <button class="nav-btn" id="tab-review" type="button" role="tab" aria-selected="false" aria-controls="view-review" tabindex="-1" data-view="review">
+            <span class="nav-ic" id="navIconReview" aria-hidden="true"></span>
+            <span class="nav-label">代码审查</span>
           </button>
         </nav>
 
@@ -373,6 +381,11 @@
                 </div>
               </section>
             </div>
+          </section>
+
+          <!-- ===== 每日代码审查视图 ===== -->
+          <section class="view" id="view-review" role="tabpanel" aria-labelledby="tab-review" aria-hidden="true">
+            <div class="review-root" id="reviewRoot"></div>
           </section>
         </div>
 

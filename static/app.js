@@ -19,6 +19,7 @@ import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   selectLog, startLogView, stopLogView, selectedLogAppId } from './js/overlays.js';
 import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
+import { initReview, enterReviewView } from './js/review.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -40,6 +41,7 @@ const stopConsoleLabel = $('#stopConsoleLabel');
 const viewLaunchpad = $('#view-launchpad');
 const viewServices = $('#view-services');
 const viewLogs = $('#view-logs');
+const viewReview = $('#view-review');
 /* 只有 data-view 的导航轨按钮参与视图切换；data-action 按钮由 widgets 代理 */
 const railBtns = [...document.querySelectorAll('.rail-btn[data-view]')];
 const sideLaunch = $('#sideLaunch');
@@ -49,7 +51,9 @@ let firstRender = true;          // 首屏渲染（stagger 入场）
 
 /* ---------------- 视图切换 ---------------- */
 function viewRoot(v) {
-  return v === 'launchpad' ? viewLaunchpad : v === 'services' ? viewServices : viewLogs;
+  return v === 'launchpad' ? viewLaunchpad
+    : v === 'services' ? viewServices
+    : v === 'logs' ? viewLogs : viewReview;
 }
 function switchView(v) {
   if (state.view === v) return;
@@ -58,6 +62,7 @@ function switchView(v) {
   localStorage.setItem('console-view', v);
   applyView();
   if (v === 'logs') enterLogsView();
+  if (v === 'review') enterReviewView();
   /* 强制重排以重播视图进入动画 */
   const active = viewRoot(v);
   active.classList.remove('active');
@@ -96,21 +101,28 @@ function applyView() {
   });
   sideLaunch.hidden = v !== 'launchpad';
   sideSvc.hidden = v !== 'services';
-  const views = { 'launchpad': viewLaunchpad, 'services': viewServices, 'logs': viewLogs };
+  const views = { 'launchpad': viewLaunchpad, 'services': viewServices,
+    'logs': viewLogs, 'review': viewReview };
   for (const key of Object.keys(views)) {
     const el = views[key];
     const active = key === v;
     el.classList.toggle('active', active);
     el.setAttribute('aria-hidden', String(!active));
   }
-  setText(viewTitle, v === 'launchpad' ? '启动台' : v === 'services' ? '服务监控' : '日志中心');
+  setText(viewTitle, v === 'launchpad' ? '启动台'
+    : v === 'services' ? '服务监控'
+    : v === 'logs' ? '日志中心' : '代码审查');
   document.documentElement.dataset.view = v;
-  setText(viewOverline, v === 'launchpad' ? 'Launchpad' : v === 'services' ? 'Services' : 'Logs');
+  setText(viewOverline, v === 'launchpad' ? 'Launchpad'
+    : v === 'services' ? 'Services'
+    : v === 'logs' ? 'Logs' : 'Review');
   setText(viewSub, v === 'launchpad'
     ? '一键启动与管理你的本地服务和批处理任务'
     : v === 'services'
       ? '实时掌握本机监听端口与进程负载'
-      : '左侧选择应用，右侧查看实时日志');
+      : v === 'logs'
+        ? '左侧选择应用，右侧查看实时日志'
+        : 'GitLab 项目每日代码审查与 AI 分析报告');
 }
 navBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
 railBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
@@ -744,8 +756,10 @@ $('#logoutBtn').addEventListener('click', doLogout);
 setChildren($('#navIconLaunch'), icon('layout-grid', 15));
 setChildren($('#navIconSvc'), icon('activity', 15));
 setChildren($('#navIconLogs'), icon('file-text', 15));
+setChildren($('#navIconReview'), icon('code', 15));
 setChildren($('#railIconLaunch'), icon('rocket', 19));
 setChildren($('#railIconSvc'), icon('activity', 19));
+setChildren($('#railIconReview'), icon('code', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));
 setChildren($('#paletteIcon'), icon('search', 15));
 buildGlyphGrid();
@@ -753,6 +767,7 @@ initAppModal({ onAddService: $('#addSvcCard'), onAddTask: $('#addTaskCard') });
 initLogDrawer();
 initThemeToggle();
 initWidgets();
+initReview();
 applyTheme();
 applyUiTheme(currentUiTheme());
 applyView();

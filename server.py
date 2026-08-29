@@ -36,6 +36,7 @@ import time
 import base64
 import hashlib
 import sqlite3
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -474,7 +475,12 @@ class Config:
     DEFAULT = {"schemaVersion": CURRENT_SCHEMA_VERSION,
                "apps": [], "hidden": [], "pinned": [], "promoted": [],
                "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME,
-               "auth": {"enforced": False}}
+               "auth": {"enforced": False},
+               "review": {"schedule": {"enabled": False, "hour": 3,
+                                       "minute": 0},
+                          "ai": {"baseUrl": "", "model": "",
+                                 "apiKeyEnv": "REVIEW_AI_KEY"},
+                          "push": {"endpoint": ""}}}
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
@@ -3666,6 +3672,37 @@ def _auth_connect(db_path):
         token TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS review_projects(
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        remote TEXT NOT NULL,
+        auth_type TEXT NOT NULL DEFAULT 'ssh',
+        auth_token TEXT NOT NULL DEFAULT '',
+        branch TEXT NOT NULL DEFAULT 'main',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_ran_at TEXT,
+        created_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS review_reports(
+        id INTEGER PRIMARY KEY,
+        day TEXT NOT NULL,
+        project_id INTEGER NOT NULL,
+        project_name TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        findings TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS review_summary(
+        id INTEGER PRIMARY KEY,
+        day TEXT NOT NULL UNIQUE,
+        summary TEXT NOT NULL DEFAULT '',
+        generated_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS review_push_logs(
+        id INTEGER PRIMARY KEY,
+        day TEXT NOT NULL,
+        endpoint TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        http_code INTEGER,
+        message TEXT NOT NULL DEFAULT '',
+        attempted_at TEXT NOT NULL)""")
     return conn
 
 def _auth_query(db_path, sql, params=()):
@@ -3777,6 +3814,356 @@ def auth_revoke_session(cfg, token):
                    (token,))
     except sqlite3.Error:
         pass
+
+
+# ---------- GitLab 每日代码审查 ----------
+# 项目清单与报告存于与登录共用的 console.db（review_* 表）；
+# 运行配置（schedule/ai/push）存 config 的 "review" 段。
+
+def _review_cfg(cfg):
+    return (cfg.snapshot() or {}).get("review") or {}
+
+def _review_safe_name(name):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name or "repo")
+
+def _review_db(cfg):
+    return auth_db_path(cfg)
+
+def review_projects(cfg):
+    rows = _auth_query(_review_db(cfg),
+                       "SELECT * FROM review_projects ORDER BY id")
+    return [dict(r) for r in rows]
+
+def review_get_project(cfg, pid):
+    rows = _auth_query(_review_db(cfg),
+                       "SELECT * FROM review_projects WHERE id=?", (pid,))
+    return dict(rows[0]) if rows else None
+
+def review_add_project(cfg, data):
+    name = (data.get("name") or "").strip()
+    remote = (data.get("remote") or "").strip()
+    if not name or not remote:
+        return None, "项目名与远程地址不能为空"
+    if any(p["name"].lower() == name.lower()
+           for p in review_projects(cfg)):
+        return None, "项目名已存在"
+    db = _review_db(cfg)
+    conn = _auth_connect(db)
+    try:
+        cur = conn.execute(
+            "INSERT INTO review_projects(name, remote, auth_type, auth_token, "
+            "branch, enabled, created_at) VALUES(?,?,?,?,?,1,?)",
+            (name, remote, data.get("auth_type") or "ssh",
+             data.get("auth_token") or "", data.get("branch") or "main",
+             datetime.datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+        return cur.lastrowid, None
+    finally:
+        conn.close()
+
+def review_update_project(cfg, pid, data):
+    row = _auth_query(_review_db(cfg),
+                      "SELECT id FROM review_projects WHERE id=?", (pid,))
+    if not row:
+        return False
+    allowed = ("name", "remote", "auth_type", "auth_token", "branch")
+    sets, params = [], []
+    for key in allowed:
+        if key in data:
+            sets.append(key + "=?")
+            params.append(data[key])
+    if "enabled" in data:
+        sets.append("enabled=?")
+        params.append(1 if data["enabled"] else 0)
+    if not sets:
+        return True
+    params.append(pid)
+    _auth_exec(_review_db(cfg),
+               "UPDATE review_projects SET " + ", ".join(sets) + " WHERE id=?",
+               params)
+    return True
+
+def review_delete_project(cfg, pid):
+    _auth_exec(_review_db(cfg),
+               "DELETE FROM review_projects WHERE id=?", (pid,))
+    return True
+
+def review_has_run_today(db_path, day):
+    return bool(_auth_query(db_path,
+                            "SELECT day FROM review_summary WHERE day=?",
+                            (day,)))
+
+def review_save_report(db_path, day, project, text):
+    _auth_exec(db_path,
+               "INSERT INTO review_reports(day, project_id, project_name, "
+               "summary, findings, created_at) VALUES(?,?,?,?,?,?)",
+               (day, project["id"], project["name"], text, "",
+                datetime.datetime.now().isoformat(timespec="seconds")))
+
+def review_save_summary(db_path, day, text):
+    _auth_exec(db_path,
+               "INSERT INTO review_summary(day, summary, generated_at) "
+               "VALUES(?,?,?)",
+               (day, text, datetime.datetime.now().isoformat(timespec="seconds")))
+
+def review_reports_for_day(cfg, day):
+    rows = _auth_query(_review_db(cfg),
+                       "SELECT * FROM review_reports WHERE day=? "
+                       "ORDER BY project_id", (day,))
+    return [dict(r) for r in rows]
+
+def review_summary_for_day(cfg, day):
+    rows = _auth_query(_review_db(cfg),
+                       "SELECT * FROM review_summary WHERE day=?", (day,))
+    return dict(rows[0]) if rows else None
+
+def review_days(cfg):
+    rows = _auth_query(_review_db(cfg),
+                       "SELECT day, generated_at FROM review_summary "
+                       "ORDER BY day DESC")
+    return [dict(r) for r in rows]
+
+def review_push_logs(cfg, day=None):
+    if day:
+        rows = _auth_query(_review_db(cfg),
+                           "SELECT * FROM review_push_logs WHERE day=? "
+                           "ORDER BY id DESC", (day,))
+    else:
+        rows = _auth_query(_review_db(cfg),
+                           "SELECT * FROM review_push_logs ORDER BY id DESC "
+                           "LIMIT 50")
+    return [dict(r) for r in rows]
+
+# ---------- git 采集与 AI 审查 ----------
+
+def _git_run(repo_dir, *args, timeout=180):
+    cmd = ["git"]
+    if repo_dir:
+        cmd += ["-C", repo_dir]
+    cmd += list(args)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                errors="replace", timeout=timeout)
+    except Exception as e:
+        raise RuntimeError("git 命令失败: %s" % (e or "未知错误"))
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "git 失败").strip())
+    return result.stdout or ""
+
+def _token_remote(remote, token):
+    prefix = "https://"
+    if token and remote.startswith(prefix):
+        return prefix + token + "@" + remote[len(prefix):]
+    return remote
+
+def _review_fetch(remote, branch, workdir, project):
+    token = project.get("auth_token") or ""
+    if project.get("auth_type") == "token" and token:
+        remote = _token_remote(remote, token)
+    name = _review_safe_name(project["name"])
+    target = os.path.join(workdir, name) if workdir else None
+    if target and not os.path.isdir(os.path.join(target, ".git")):
+        try:
+            subprocess.run(["git", "clone", remote, target],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=300)
+        except Exception as e:
+            raise RuntimeError("git clone 失败: %s" % (e or "未知错误"))
+    if target:
+        try:
+            _git_run(target, "fetch", "origin")
+        except Exception:
+            pass
+        try:
+            _git_run(target, "checkout", branch)
+        except Exception:
+            pass
+    return target
+
+def _build_review_prompt(project_name, day, commits, diffs):
+    return (
+        "你是资深代码审查专家。下面是对 GitLab 项目 %s 在 %s 的当日提交清单与部分 diff。"
+        "请输出 Markdown 报告，包含：\n"
+        "1. **本期概览**：这些提交主要解决了什么功能/问题（用中文一句话概述）；\n"
+        "2. **发现的问题**：安全与性能等问题分点列出（无问题就写\"无\"）；\n"
+        "3. **提交清单**：逐条列 commit 摘要。\n"
+        "输出要精炼、只写结论，不要复述 diff。\n\n"
+        "## 提交\n%s\n\n## diff（节选）\n%s\n"
+        % (project_name, day, "\n".join(commits), diffs[:8000]))
+
+def _review_ask_ai(ai, prompt):
+    """调用 OpenAI 兼容 Chat Completions（标准库 urllib，零依赖）。"""
+    base = (ai.get("baseUrl") or "").rstrip("/")
+    if not base:
+        raise ValueError("未配置 AI 接口地址（review.ai.baseUrl）")
+    model = ai.get("model") or "gpt-4o-mini"
+    key_env = ai.get("apiKeyEnv") or "REVIEW_AI_KEY"
+    key = os.environ.get(key_env) or ""
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system",
+             "content": "你是资深代码审查助手，输出精炼的 Markdown。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    req = urllib.request.Request(
+        base + "/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        body = r.read().decode("utf-8")
+    return json.loads(body)["choices"][0]["message"]["content"]
+
+def _review_one_project(cfg, project, day, ai, workdir):
+    remote = project["remote"]
+    branch = project.get("branch") or "main"
+    target = _review_fetch(remote, branch, workdir, project)
+    log = _git_run(target, "log", "--since=%s 00:00" % day,
+                   "--until=%s 23:59:59" % day,
+                   "--pretty=format:%H|%an|%s")
+    commits = [ln for ln in log.splitlines() if ln.strip()]
+    if not commits:
+        return "今日暂无提交。"
+    diffs = []
+    for line in commits[:25]:
+        sha = line.split("|", 1)[0]
+        try:
+            patch = _git_run(target, "show", sha, "--format=") or ""
+        except Exception:
+            patch = ""
+        diffs.append("### %s\n%s" % (line, patch[:4000]))
+        if len(diffs) >= 12:
+            break
+    if not (ai.get("baseUrl")):
+        body = "\n\n".join(commits)
+        return body + "\n\n> 未配置 AI（review.ai.baseUrl），仅列出提交。"
+    prompt = _build_review_prompt(project["name"], day, commits, "\n".join(diffs))
+    return _review_ask_ai(ai, prompt)
+
+def review_push_payload(cfg, day):
+    summary = review_summary_for_day(cfg, day)
+    reports = review_reports_for_day(cfg, day)
+    return {
+        "day": day,
+        "summary": (summary or {}).get("summary", ""),
+        "projects": [
+            {"project": r["project_name"], "report": r["summary"]}
+            for r in reports
+        ],
+    }
+
+def review_push_report(cfg, day):
+    push = (_review_cfg(cfg).get("push") or {})
+    endpoint = (push.get("endpoint") or "").strip()
+    db = _review_db(cfg)
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    if not endpoint:
+        _auth_exec(db, "INSERT INTO review_push_logs(day, endpoint, status, "
+                       "http_code, message, attempted_at) "
+                       "VALUES(?,?,?,?,?,?)",
+                   (day, "", "disabled", None, "未配置推送端点", now))
+        return None
+    payload = review_push_payload(cfg, day)
+    headers = {"Content-Type": "application/json"}
+    try:
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            code = r.status
+        status, message = "success", ""
+    except urllib.error.HTTPError as e:
+        code = e.code
+        status, message = "failed", e.reason or ("HTTP " + str(code))
+    except Exception as e:
+        code = None
+        status, message = "failed", (str(e) or "推送失败")[:200]
+    _auth_exec(db, "INSERT INTO review_push_logs(day, endpoint, status, "
+                   "http_code, message, attempted_at) "
+                   "VALUES(?,?,?,?,?,?)",
+               (day, endpoint, status, code, message, now))
+    return status
+
+def review_run_day(cfg, day):
+    """对全部启用项目抓取当日提交并生成报告；返回汇总 Markdown。"""
+    review = _review_cfg(cfg)
+    ai = review.get("ai") or {}
+    projects = [p for p in review_projects(cfg) if p["enabled"]]
+    db = _review_db(cfg)
+    workdir = os.path.join(DATA_DIR, "review")
+    try:
+        _ensure_private_dir(workdir)
+    except OSError:
+        workdir = None
+    reports = []
+    for project in projects:
+        try:
+            text = _review_one_project(cfg, project, day, ai, workdir)
+        except Exception as e:
+            LOG.exception("项目代码审查失败: %s", project.get("name"))
+            text = "**审查失败**：%s" % (e or "未知错误")
+        review_save_report(db, day, project, text)
+        reports.append({"project": project["name"], "text": text})
+    lines = ["# 每日代码审查 · %s" % day, "---"]
+    for r in reports:
+        lines.append("## %s" % r["project"])
+        lines.append(r["text"])
+    summary = "\n\n".join(lines)
+    review_save_summary(db, day, summary)
+    try:
+        review_push_report(cfg, day)
+    except Exception:
+        LOG.exception("报告推送失败")
+    return summary
+
+def review_run(cfg, day=None):
+    """手动触发：当前日或缺省日执行一次，返回报告文本。"""
+    day = day or datetime.date.today().isoformat()
+    with REVIEW_DAILY_LOCK:
+        return review_run_day(cfg, day)
+
+
+REVIEW_DAILY_LOCK = threading.Lock()
+
+def start_review_scheduler():
+    """每日定时（默认 03:00）+ 重启漏跑补偿，daemon 线程。"""
+    def attempt():
+        cfg = Config(CONFIG_PATH)
+        review = _review_cfg(cfg)
+        sched = review.get("schedule") or {}
+        if not sched.get("enabled"):
+            return
+        db = auth_db_path(cfg)
+        today = datetime.date.today().isoformat()
+        if review_has_run_today(db, today):
+            return
+        hour = int(sched.get("hour", 3))
+        minute = int(sched.get("minute", 0))
+        now = datetime.datetime.now()
+        reached = (now.hour, now.minute) == (hour, minute)
+        passed = now.hour > hour or (now.hour == hour and now.minute >= minute)
+        # 到达设定时刻，或已过设定时刻（当日漏跑补偿，仅补当天）。
+        if reached or passed:
+            with REVIEW_DAILY_LOCK:
+                if not review_has_run_today(db, today):
+                    try:
+                        review_run_day(cfg, today)
+                    except Exception:
+                        LOG.exception("每日代码审查执行失败")
+    def target():
+        while True:
+            try:
+                attempt()
+            except Exception:
+                LOG.exception("每日代码审查调度异常")
+            time.sleep(20)
+    threading.Thread(target=target, daemon=True).start()
 
 
 class ConsoleServer(ThreadingHTTPServer):
@@ -4057,6 +4444,114 @@ class Handler(BaseHTTPRequestHandler):
         with self.server._auth_fail_guard:
             self.server._auth_fail_ts = []
 
+    # ---------- GitLab 每日代码审查 ----------
+
+    def handle_review_state(self):
+        cfg = self.server.cfg
+        review = _review_cfg(cfg)
+        self.send_json({
+            "ok": True,
+            "configured": bool((review.get("ai") or {}).get("baseUrl")),
+            "schedule": review.get("schedule") or {},
+            "ai": {"baseUrl": (review.get("ai") or {}).get("baseUrl", ""),
+                   "model": (review.get("ai") or {}).get("model", ""),
+                   "apiKeyEnv": (review.get("ai") or {}).get("apiKeyEnv",
+                                                             "REVIEW_AI_KEY")},
+            "pushEndpoint": (review.get("push") or {}).get("endpoint", ""),
+            "projects": review_projects(cfg),
+            "days": review_days(cfg),
+        })
+
+    def handle_review_reports(self, day):
+        cfg = self.server.cfg
+        self.send_json({
+            "ok": True,
+            "day": day,
+            "summary": review_summary_for_day(cfg, day),
+            "reports": review_reports_for_day(cfg, day),
+            "pushLogs": review_push_logs(cfg, day),
+        })
+
+    def handle_review_projects_create(self):
+        cfg = self.server.cfg
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        if not isinstance(data, dict):
+            self.send_err(400, "请求体必须是 JSON 对象")
+            return
+        pid, err = review_add_project(cfg, data)
+        if err:
+            self.send_err(400, err)
+            return
+        self.send_json({"ok": True, "id": pid,
+                        "project": review_get_project(cfg, pid)})
+
+    def handle_review_project_update(self, pid):
+        cfg = self.server.cfg
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        if not isinstance(data, dict):
+            self.send_err(400, "请求体必须是 JSON 对象")
+            return
+        if not review_update_project(cfg, pid, data):
+            self.send_err(404, "项目不存在")
+            return
+        self.send_json({"ok": True, "project": review_get_project(cfg, pid)})
+
+    def handle_review_project_delete(self, pid):
+        cfg = self.server.cfg
+        if not review_get_project(cfg, pid):
+            self.send_err(404, "项目不存在")
+            return
+        review_delete_project(cfg, pid)
+        self.send_json({"ok": True})
+
+    def handle_review_run(self, query):
+        self.discard_body()
+        cfg = self.server.cfg
+        day = datetime.date.today().isoformat()
+        try:
+            qday = (urllib.parse.parse_qs(query).get("day") or [None])[0]
+            if qday:
+                day = qday
+        except Exception:
+            pass
+        try:
+            summary = review_run(cfg, day)
+        except Exception as e:
+            self.send_err(500, "审查执行失败：%s" % (str(e) or "未知错误"))
+            return
+        self.send_json({"ok": True, "day": day, "summary": summary})
+
+    def handle_review_config(self):
+        cfg = self.server.cfg
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        if not isinstance(data, dict):
+            self.send_err(400, "请求体必须是 JSON 对象")
+            return
+        def op(c):
+            review = {"schedule": {}, "ai": {}, "push": {}}
+            old = c.get("review") or {}
+            for key in ("schedule", "ai", "push"):
+                value = data.get(key)
+                review[key] = value if isinstance(value, dict) else (
+                    old.get(key) or {})
+            c["review"] = review
+            return dict(review)
+        try:
+            saved = cfg.update(op)
+        except OSError as e:
+            self.send_err(503, str(e))
+            return
+        self.send_json({"ok": True, "review": saved})
+
     def _deny_request(self, status, message):
         # Do not consume attacker-controlled bodies. Closing after the bounded
         # JSON error prevents keep-alive request smuggling via leftover bytes.
@@ -4255,6 +4750,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/console/log":
                 self.handle_console_log(parsed.query)
                 return
+            if path == "/api/review":
+                self.handle_review_state()
+                return
+            if path == "/api/review/reports":
+                day = (urllib.parse.parse_qs(parsed.query)
+                       .get("day", [datetime.date.today().isoformat()])[0])
+                self.handle_review_reports(day)
+                return
             m = APP_ROUTE_RE.match(path)
             if m and m.group(2) == "logs":
                 self.handle_logs(m.group(1), parsed.query)
@@ -4353,6 +4856,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/auth/logout":
                 self.discard_body()
                 self.handle_auth_logout()
+                return
+            if path == "/api/review/projects":
+                self.handle_review_projects_create()
+                return
+            if path == "/api/review/config":
+                self.handle_review_config()
+                return
+            if path == "/api/review/run":
+                self.handle_review_run(urllib.parse.urlparse(self.path).query)
                 return
             route_match = APP_ROUTE_RE.match(path)
             content_kind = ("image" if route_match and
@@ -4912,6 +5424,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             path = urllib.parse.urlparse(self.path).path
             m = APP_ROUTE_RE.match(path)
+            if path.startswith("/api/review/projects/"):
+                rest = path[len("/api/review/projects/"):]
+                if rest.isdigit():
+                    self.handle_review_project_update(int(rest))
+                else:
+                    self.send_err(404, "接口不存在")
+                return
             if not (m and m.group(2) is None):
                 self.send_err(404, "接口不存在")
                 return
@@ -4988,6 +5507,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             path = urllib.parse.urlparse(self.path).path
             m = APP_ROUTE_RE.match(path)
+            if path.startswith("/api/review/projects/"):
+                rest = path[len("/api/review/projects/"):]
+                if rest.isdigit():
+                    self.handle_review_project_delete(int(rest))
+                else:
+                    self.send_err(404, "接口不存在")
+                return
             if not m:
                 self.send_err(404, "接口不存在")
                 return
@@ -5323,6 +5849,7 @@ def _run_console(preferred_port=None, open_browser=True):
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
         _ensure_private_dir(private_dir)
     start_log_maintenance()
+    start_review_scheduler()
     cfg = Config(CONFIG_PATH)
 
     server, port = None, None
