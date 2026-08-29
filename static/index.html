@@ -97,6 +97,7 @@
               <span class="console-action-label" id="stopConsoleLabel">停止</span>
             </button>
             <button class="icon-btn" id="themeBtn" type="button" title="切换主题" aria-label="切换主题"></button>
+            <button class="icon-btn" id="logoutBtn" type="button" title="退出登录" aria-label="退出登录"></button>
             <a class="icon-btn" id="githubLink" href="https://github.com/cabfan/local-ops" target="_blank" rel="noopener noreferrer" title="查看源码 · GitHub" aria-label="查看源码（GitHub 仓库）"></a>
           </div>
         </div>
@@ -631,6 +632,28 @@
 
 <!-- Toast 提示 -->
 <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<!-- 登录屏：强制登录/局域网访问时展示 -->
+<div class="login-screen" id="loginScreen" aria-label="登录总控台" aria-hidden="true" inert>
+  <form class="login-card" id="loginForm" novalidate>
+    <div class="login-brand">
+      <span class="login-brand-mark" aria-hidden="true"><img src="/assets/brand-mark.png" alt=""></span>
+      <h1 class="login-title" id="loginTitle">登录总控台</h1>
+      <p class="login-sub" id="loginSub">输入访问口令以继续</p>
+    </div>
+    <label class="login-field">
+      <span class="login-label" id="loginLabel">访问口令</span>
+      <input class="login-input" id="loginPass" type="password" autocomplete="current-password" required minlength="8">
+    </label>
+    <label class="login-remember" id="loginRememberWrap">
+      <input id="loginRemember" type="checkbox">
+      <span>记住我（30 天）</span>
+    </label>
+    <div class="login-err" id="loginErr" role="alert" aria-live="polite"></div>
+    <button class="login-btn" id="loginBtn" type="submit">登录</button>
+    <p class="login-hint" id="loginHint"></p>
+  </form>
+</div>
 
 <script src="/icons.js" defer></script>
 <script src="/app.js" type="module" defer></script>

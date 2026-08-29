@@ -502,6 +502,12 @@ function paletteActions() {
     hint: '系统 · data/logs/console.log',
     run: openConsoleLog,
   });
+  items.push({
+    icon: 'x',
+    title: '退出登录',
+    hint: '清除当前登录会话',
+    run: doLogout,
+  });
   return items;
 }
 
@@ -641,11 +647,100 @@ document.addEventListener('keydown', e => {
 });
 
 /* ============================================================
+   登录
+   ============================================================ */
+const loginScreen = $('#loginScreen');
+const loginForm = $('#loginForm');
+const loginTitle = $('#loginTitle');
+const loginSub = $('#loginSub');
+const loginLabel = $('#loginLabel');
+const loginPass = $('#loginPass');
+const loginRememberWrap = $('#loginRememberWrap');
+const loginRemember = $('#loginRemember');
+const loginErr = $('#loginErr');
+const loginHint = $('#loginHint');
+const loginBtn = $('#loginBtn');
+let loginMode = 'login';
+
+function setTextSilent(node, text) {
+  if (node._t === text) return;
+  node._t = text;
+  node.textContent = text;
+}
+function setLoginScreen(open) {
+  loginScreen.classList.toggle('open', open);
+  loginScreen.setAttribute('aria-hidden', String(!open));
+  loginScreen.inert = !open;
+  const shell = document.querySelector('.shell');
+  if (shell) shell.inert = open;
+  if (open) setTimeout(() => loginPass.focus(), 50);
+}
+function initLoginScreen(hasAccount) {
+  loginMode = hasAccount ? 'login' : 'setup';
+  setTextSilent(loginTitle, hasAccount ? '登录总控台' : '设置访问口令');
+  setTextSilent(loginSub, hasAccount ? '输入访问口令以继续' : '首次使用，请先设置一个访问口令');
+  setTextSilent(loginLabel, '访问口令');
+  loginRememberWrap.classList.toggle('show', hasAccount);
+  setTextSilent(loginBtn, hasAccount ? '登录' : '设置口令');
+  setTextSilent(loginHint,
+    hasAccount ? '本机回环访问免登录；局域网访问需口令。'
+               : '口令至少 8 位，局域网访问或强制登录时使用。');
+  loginErr.textContent = '';
+  setLoginScreen(true);
+}
+function finishLogin() {
+  loginPass.value = '';
+  loginErr.textContent = '';
+  setLoginScreen(false);
+  poll(true).finally(() => schedulePoll());
+}
+async function initAuthGate() {
+  try {
+    const r = await fetch('/api/auth/status', { cache: 'no-store' });
+    const s = await r.json();
+    if (s && s.forced && !s.loggedIn) {
+      initLoginScreen(Boolean(s.hasAccount));
+      return;
+    }
+  } catch (e) {
+    // 后端不可达：交由下方轮询统一做断连处理。
+  }
+  poll(true).finally(() => schedulePoll());
+}
+loginForm.addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const password = loginPass.value;
+  loginBtn.disabled = true;
+  loginErr.textContent = '';
+  try {
+    const r = loginMode === 'setup'
+      ? await post('/api/auth/setup', { password })
+      : await post('/api/auth/login', {
+          password, remember: loginRemember.checked });
+    if (r && r.ok === false) {
+      loginErr.textContent = r.error || '操作失败';
+      return;
+    }
+    finishLogin();
+  } catch (e) {
+    loginErr.textContent = '请求失败：' + ((e && e.message) || '网络异常');
+  } finally {
+    loginBtn.disabled = false;
+  }
+});
+async function doLogout() {
+  await act(post('/api/auth/logout', {}));
+  location.reload();
+}
+
+/* ============================================================
    初始化
    ============================================================ */
 setChildren(restartConsoleIcon, icon('refresh-cw', 14));
 setChildren(stopConsoleIcon, icon('power', 14));
 setChildren($('#githubLink'), icon('github', 15));
+setChildren($('#logoutBtn'), icon('power', 14));
+$('#logoutBtn').addEventListener('click', doLogout);
 setChildren($('#navIconLaunch'), icon('layout-grid', 15));
 setChildren($('#navIconSvc'), icon('activity', 15));
 setChildren($('#navIconLogs'), icon('file-text', 15));
@@ -661,4 +756,4 @@ initWidgets();
 applyTheme();
 applyUiTheme(currentUiTheme());
 applyView();
-poll(true).finally(() => schedulePoll());
+initAuthGate();

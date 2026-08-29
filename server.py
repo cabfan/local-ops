@@ -33,6 +33,9 @@ import sys
 import tempfile
 import threading
 import time
+import base64
+import hashlib
+import sqlite3
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -470,7 +473,8 @@ class Config:
 
     DEFAULT = {"schemaVersion": CURRENT_SCHEMA_VERSION,
                "apps": [], "hidden": [], "pinned": [], "promoted": [],
-               "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME}
+               "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME,
+               "auth": {"enforced": False}}
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
@@ -3629,6 +3633,152 @@ def serialized_app_operation(fn):
     return wrapped
 
 
+# ---------- 登录认证 ----------
+# 零依赖：口令哈希用标准库 hashlib.scrypt，会话存于 config 同目录的 SQLite
+# 库（sqlite3）。测试用临时 config 时，会在临时目录建独立库，互不污染。
+
+AUTH_SCRYPT_N_LOG2 = 14
+AUTH_SCRYPT_R = 8
+AUTH_SCRYPT_P = 1
+AUTH_DK_LEN = 64
+AUTH_SESSION_TTL = 12 * 3600            # 默认会话有效期
+AUTH_SESSION_TTL_REMEMBER = 30 * 86400  # 「记住我」会话有效期
+AUTH_FAIL_LIMIT = 8                     # 连续失败熔断阈值
+AUTH_FAIL_WINDOW = 300                  # 熔断窗口（秒），窗口内重置
+
+def auth_db_path(cfg):
+    return os.path.join(os.path.dirname(cfg._path) or ".", "console.db")
+
+def _auth_connect(db_path):
+    try:
+        _ensure_private_dir(os.path.dirname(db_path) or ".")
+    except OSError:
+        pass
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounts(
+        id INTEGER PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        hash_value TEXT NOT NULL,
+        created_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS sessions(
+        token TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL)""")
+    return conn
+
+def _auth_query(db_path, sql, params=()):
+    conn = _auth_connect(db_path)
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+def _auth_exec(db_path, sql, params=()):
+    conn = _auth_connect(db_path)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+def auth_db_available(db_path):
+    """应用是否已设过账号（决定走「首登设置」还是「口令登录」）。"""
+    try:
+        return bool(_auth_query(db_path,
+                                "SELECT id FROM accounts LIMIT 1"))
+    except sqlite3.Error:
+        return False
+
+def auth_hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"), salt=salt,
+        n=1 << AUTH_SCRYPT_N_LOG2, r=AUTH_SCRYPT_R,
+        p=AUTH_SCRYPT_P, dklen=AUTH_DK_LEN)
+    return "scrypt$%s$%s" % (
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"))
+
+def auth_verify_password(password, stored):
+    try:
+        kind, salt_b64, hash_b64 = stored.split("$", 2)
+        if kind != "scrypt":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+    except Exception:
+        return False
+    try:
+        digest = hashlib.scrypt(
+            password.encode("utf-8"), salt=salt,
+            n=1 << AUTH_SCRYPT_N_LOG2, r=AUTH_SCRYPT_R,
+            p=AUTH_SCRYPT_P, dklen=AUTH_DK_LEN)
+    except ValueError:
+        return False
+    return len(digest) == len(expected) and secrets.compare_digest(digest, expected)
+
+def auth_would_be_weak(password):
+    if not isinstance(password, str):
+        return True
+    if len(password) < 8 or len(password) > 128:
+        return True
+    return False
+
+def auth_create_account(cfg, password):
+    db = auth_db_path(cfg)
+    if auth_db_available(db):
+        return False
+    stored = auth_hash_password(password)
+    _auth_exec(db, "INSERT INTO accounts(username, hash_value, created_at) "
+                   "VALUES('admin', ?, ?)",
+               (stored, datetime.datetime.now().isoformat(timespec="seconds")))
+    return True
+
+def auth_check_credentials(cfg, password):
+    db = auth_db_path(cfg)
+    rows = _auth_query(db, "SELECT hash_value FROM accounts "
+                           "WHERE username='admin' LIMIT 1")
+    if not rows:
+        return False
+    return auth_verify_password(password, rows[0]["hash_value"])
+
+def auth_create_session(cfg, remember):
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    ttl = AUTH_SESSION_TTL_REMEMBER if remember else AUTH_SESSION_TTL
+    _auth_exec(auth_db_path(cfg),
+               "INSERT INTO sessions(token, created_at, expires_at) "
+               "VALUES(?, ?, ?)", (token, now, now + ttl))
+    return token
+
+def auth_validate_session(cfg, token):
+    if not token:
+        return False
+    try:
+        rows = _auth_query(auth_db_path(cfg),
+                           "SELECT expires_at FROM sessions WHERE token=?",
+                           (token,))
+    except sqlite3.Error:
+        return False
+    if not rows:
+        return False
+    try:
+        return float(rows[0]["expires_at"]) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+def auth_revoke_session(cfg, token):
+    if not token:
+        return
+    try:
+        _auth_exec(auth_db_path(cfg), "DELETE FROM sessions WHERE token=?",
+                   (token,))
+    except sqlite3.Error:
+        pass
+
+
 class ConsoleServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -3643,6 +3793,8 @@ class ConsoleServer(ThreadingHTTPServer):
         self._console_action_guard = threading.Lock()
         self._console_action = None
         self._console_helper_pid = None
+        self._auth_fail_ts = []          # 最近登录失败时间戳（熔断防爆破）
+        self._auth_fail_guard = threading.Lock()
 
     def handle_error(self, request, client_address):
         """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
@@ -3753,6 +3905,158 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError):
             return False
 
+    # ---------- 登录门控 ----------
+
+    def _login_enforced(self):
+        """是否需要登录：开启强制登录，或访问来源既非回环也未命中白名单。"""
+        auth = {}
+        try:
+            auth = (self.server.cfg.snapshot() or {}).get("auth") or {}
+        except Exception:
+            auth = {}
+        if auth.get("enforced"):
+            return True
+        try:
+            client_ip = self.client_address[0]
+        except (AttributeError, IndexError):
+            return True
+        if client_ip in ("127.0.0.1", "::1"):
+            return False
+        return not _ip_in_lan_allow(client_ip)
+
+    def _is_static_path(self, path):
+        if path in ("/", "/index.html"):
+            return True
+        return os.path.splitext(path)[1].lower() in (
+            ".html", ".css", ".js", ".json", ".svg", ".png", ".ico",
+            ".woff2", ".jpg", ".jpeg", ".webp", ".otf", ".txt")
+
+    def _is_public_login_path(self, path):
+        """登录模式（即便未登录）仍可达的路径：登录接口、健康、登录页静态资源。"""
+        if path.startswith("/api/auth/"):
+            return True
+        if path.startswith("/icons/"):
+            return True
+        if path in ("/favicon.ico", "/api/health"):
+            return True
+        return self._is_static_path(path)
+
+    def _login_cookie_token(self):
+        try:
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie") or "")
+            morsel = cookie.get("console_login")
+            return morsel.value if morsel else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _login_gate(self):
+        """业务接口登录门控。放行返回 True；需登录但未登录时 401 并返回 False。"""
+        try:
+            if not self._login_enforced():
+                return True
+            if self._is_public_login_path(
+                    urllib.parse.urlparse(self.path).path):
+                return True
+            if auth_validate_session(
+                    self.server.cfg, self._login_cookie_token()):
+                return True
+        except Exception:
+            pass
+        self.close_connection = True
+        self.send_json({"ok": False, "error": "未登录",
+                        "auth": "required"}, 401)
+        return False
+
+    @staticmethod
+    def _login_cookie_header(token, max_age=None):
+        parts = ["console_login=%s; Path=/; HttpOnly; SameSite=Strict" % token]
+        if max_age:
+            parts.append("Max-Age=%d" % max_age)
+        return "; ".join(parts)
+
+    # ---------- 登录接口 ----------
+
+    def handle_auth_status(self):
+        cfg = self.server.cfg
+        token = self._login_cookie_token()
+        login = bool(token and auth_validate_session(cfg, token))
+        self.send_json({
+            "ok": True,
+            "loggedIn": login,
+            "forced": bool(self._login_enforced()),
+            "hasAccount": bool(auth_db_available(auth_db_path(cfg))),
+        })
+
+    def handle_auth_setup(self):
+        cfg = self.server.cfg
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        password = data.get("password") if isinstance(data, dict) else None
+        if auth_would_be_weak(password):
+            self.send_err(400, "口令至少 8 位，且不超过 128 位")
+            return
+        if not auth_create_account(cfg, password):
+            self.send_err(409, "账号已存在，请直接登录")
+            return
+        token = auth_create_session(cfg, remember=False)
+        self.send_json({"ok": True, "hasAccount": True},
+                       extra_cookies=[self._login_cookie_header(token)])
+
+    def handle_auth_login(self):
+        cfg = self.server.cfg
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        if not isinstance(data, dict) or auth_would_be_weak(
+                data.get("password")):
+            self.send_err(400, "请输入口令")
+            return
+        if not auth_db_available(auth_db_path(cfg)):
+            self.send_err(409, "尚未设置口令，请先完成首登设置")
+            return
+        if not auth_check_credentials(cfg, data.get("password")):
+            self._register_failed_login()
+            if self._login_locked():
+                self.send_json({"ok": False,
+                                "error": "尝试过于频繁，请稍后再试"}, 429)
+            else:
+                self.send_json({"ok": False,
+                                "error": "口令错误，可重试"}, 401)
+            return
+        self._reset_failed_logins()
+        token = auth_create_session(cfg, bool(data.get("remember")))
+        self.send_json({"ok": True},
+                       extra_cookies=[self._login_cookie_header(token)])
+
+    def handle_auth_logout(self):
+        auth_revoke_session(self.server.cfg, self._login_cookie_token())
+        self.send_json({"ok": True}, extra_cookies=[
+            self._login_cookie_header("", max_age=0)])
+
+    def _register_failed_login(self):
+        now = time.time()
+        with self.server._auth_fail_guard:
+            self.server._auth_fail_ts = [
+                t for t in self.server._auth_fail_ts
+                if now - t <= AUTH_FAIL_WINDOW]
+            self.server._auth_fail_ts.append(now)
+
+    def _login_locked(self):
+        now = time.time()
+        with self.server._auth_fail_guard:
+            self.server._auth_fail_ts = [
+                t for t in self.server._auth_fail_ts
+                if now - t <= AUTH_FAIL_WINDOW]
+            return len(self.server._auth_fail_ts) >= AUTH_FAIL_LIMIT
+
+    def _reset_failed_logins(self):
+        with self.server._auth_fail_guard:
+            self.server._auth_fail_ts = []
+
     def _deny_request(self, status, message):
         # Do not consume attacker-controlled bodies. Closing after the bounded
         # JSON error prevents keep-alive request smuggling via leftover bytes.
@@ -3778,7 +4082,21 @@ class Handler(BaseHTTPRequestHandler):
         """
         host = self._parsed_request_host()
         if host is None or not self._request_host_allowed():
-            return self._deny_request(421, "请求 Host 不是当前本地控制台")
+            # 回环/LAN 白名单之外：已登录会话可信，放行走后续会话校验；
+            # 未登录来源仍是 421（DNS rebinding 防护），由门控兜底引导登录。
+            if (self._login_enforced()
+                    and auth_validate_session(
+                        self.server.cfg, self._login_cookie_token())):
+                try:
+                    parsed = urllib.parse.urlsplit(
+                        "http://" + (self.headers.get("Host") or ""))
+                    host = ((parsed.hostname or "").lower(), parsed.port)
+                except (ValueError, UnicodeError):
+                    host = None
+                if host is None or host[1] != self.server.console_port:
+                    return self._deny_request(421, "请求 Host 不是当前本地控制台")
+            else:
+                return self._deny_request(421, "请求 Host 不是当前本地控制台")
         if not mutating:
             return True
 
@@ -3816,7 +4134,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _send(self, body, status=200, ctype="text/plain; charset=utf-8",
-              set_cookie=True):
+              set_cookie=True, extra_cookies=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -3836,6 +4154,8 @@ class Handler(BaseHTTPRequestHandler):
                 "Set-Cookie",
                 "console_session=%s; Path=/; HttpOnly; SameSite=Strict" %
                 self.server.control_token)
+        for cookie in (extra_cookies or []):
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         if body:
             try:
@@ -3844,9 +4164,10 @@ class Handler(BaseHTTPRequestHandler):
                 # 客户端提前断开（10053 等）属正常现象，静默忽略。
                 pass
 
-    def send_json(self, obj, status=200):
+    def send_json(self, obj, status=200, extra_cookies=None):
         self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-                   status, "application/json; charset=utf-8")
+                   status, "application/json; charset=utf-8",
+                   extra_cookies=extra_cookies)
 
     def send_err(self, status, msg):
         self.send_json({"ok": False, "error": msg}, status)
@@ -3896,6 +4217,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if not self._login_gate():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            if path == "/api/auth/status":
+                self.handle_auth_status()
+                return
+            if self._login_enforced():
+                # 登录模式下放行登录所需的健康/静态资源，业务接口走门控+会话校验。
+                if path == "/api/health":
+                    self.send_json(build_health(self.server.cfg))
+                    return
+                if path == "/favicon.ico":
+                    self.serve_static("/assets/favicon.ico")
+                    return
+                if path.startswith("/icons/"):
+                    self.serve_icon(path)
+                    return
+                if self._is_static_path(path):
+                    self.serve_static(path)
+                    return
             if not self.authorize_request():
                 return
             parsed = urllib.parse.urlparse(self.path)
@@ -3999,7 +4341,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if not self._login_gate():
+                return
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/auth/login":
+                self.handle_auth_login()
+                return
+            if path == "/api/auth/setup":
+                self.handle_auth_setup()
+                return
+            if path == "/api/auth/logout":
+                self.discard_body()
+                self.handle_auth_logout()
+                return
             route_match = APP_ROUTE_RE.match(path)
             content_kind = ("image" if route_match and
                             route_match.group(2) == "icon" else "json")
@@ -4551,6 +4905,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         operation_lock = None
         try:
+            if not self._login_gate():
+                return
             if not self.authorize_request(mutating=True,
                                           content_kind="json"):
                 return
@@ -4626,6 +4982,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         try:
+            if not self._login_gate():
+                return
             if not self.authorize_request(mutating=True):
                 return
             path = urllib.parse.urlparse(self.path).path
