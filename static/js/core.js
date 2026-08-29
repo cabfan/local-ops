@@ -230,8 +230,8 @@ export function closeLayer(layer) {
   if (target && target.isConnected) setTimeout(() => target.focus(), 0);
 }
 const LAYER_IDS = ['#confirmMask', '#portDiagMask',
-  '#appDiagMask', '#appModalMask', '#paletteMask', '#logDrawer',
-  '#logsMask', '#settingsMask'];
+  '#appDiagMask', '#appModalMask', '#paletteMask',
+  '#settingsMask'];
 export function activeLayer() {
   for (const id of LAYER_IDS) {
     const layer = $(id);

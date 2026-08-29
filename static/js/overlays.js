@@ -4,7 +4,7 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp, bumpMutationEpoch } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch, state } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -27,8 +27,7 @@ const confirmMask = $('#confirmMask'), confirmTitle = $('#confirmTitle'), confir
 const forceRow = $('#forceRow'), forceCheck = $('#forceCheck');
 const confirmCancel = $('#confirmCancel'), confirmOk = $('#confirmOk');
 
-const drawerMask = $('#drawerMask'), logDrawer = $('#logDrawer');
-const drawerTitle = $('#drawerTitle'), drawerClose = $('#drawerClose');
+const logsTitle = $('#logsMainTitle'), logsRefresh = $('#logsRefresh');
 const logBody = $('#logBody'), logPre = $('#logPre');
 
 const iconVer = new Map();   // appId → 图标版本号，上传/删除后刷新浏览器缓存
@@ -652,7 +651,8 @@ export function initAppModal({ onAddService, onAddTask }) {
 }
 
 /* ============================================================
-   日志抽屉
+   日志中心视图：左侧列表选中后，右侧面板内拉取并轮询日志
+   宿主是独立视图（不再有弹层/抽屉），但增量追加与滚动逻辑同一份。
    ============================================================ */
 let logTimer = null;
 let logAppId = null;
@@ -665,27 +665,47 @@ function logEndpoint(appId) {
     : '/api/apps/' + appId + '/logs?tail=300';
 }
 
+export function selectedLogAppId() { return logAppId; }
+
+/* 从应用/总控台日志入口请求查看：跳到日志中心视图并定位到该应用。
+   真正选中与拉取由视图切入后的 enterLogsView 完成（避免重复请求）。 */
 export function openLogs(app) {
-  openLogDrawer(app.id, (app.name || '') + ' · 日志');
+  if (window.__goLogsView) window.__goLogsView(app.id, (app.name || '') + ' · 日志');
+  else selectLog(app.id, (app.name || '') + ' · 日志');
 }
 export function openConsoleLog() {
-  openLogDrawer('console', '总控台 · 日志');
+  if (window.__goLogsView) window.__goLogsView('console', '总控台 · 日志');
+  else selectLog('console', '总控台 · 日志');
 }
-function openLogDrawer(appId, title) {
-  closeLogs();
+
+export function selectLog(appId, title) {
+  stopLogPolling();
   logAppId = appId;
   logIsConsole = appId === 'console';
   const requestSeq = ++logRequestSeq;
-  drawerTitle.textContent = title;
-  logPre.textContent = '加载中…';
+  setText(logsTitle, title || '');
+  clearLogBody();
   logBody.setAttribute('aria-busy', 'true');
-  openLayer(logDrawer, drawerClose);
-  drawerMask.classList.add('open');
-  drawerMask.setAttribute('aria-hidden', 'false');
   fetchLogs(appId, requestSeq);
 }
+
+/* 进入日志中心视图：若有选中则恢复轮询（续拉）；无选中由 app.js 负责默认打开。 */
+export function startLogView() {
+  if (logAppId !== null) fetchLogs(logAppId, ++logRequestSeq);
+}
+/* 离开日志中心视图：停止轮询，保留当前选中，切回时可续拉。 */
+export function stopLogView() {
+  stopLogPolling();
+}
+
+function stopLogPolling() {
+  logRequestSeq += 1;
+  if (logTimer) { clearTimeout(logTimer); logTimer = null; }
+  if (logController) { logController.abort(); logController = null; }
+}
+
 async function fetchLogs(appId, requestSeq) {
-  if (!logAppId || logAppId !== appId || requestSeq !== logRequestSeq) return;
+  if (logAppId !== appId || requestSeq !== logRequestSeq) return;
   const controller = new AbortController();
   logController = controller;
   try {
@@ -700,12 +720,17 @@ async function fetchLogs(appId, requestSeq) {
     const nearBottom = firstLoad ||
       logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 48;
     const text = j.text || '';
-    /* 增量追加新行：全量重写会打断用户选区并让滚动位置漂移。 */
-    const previous = firstLoad ? '' : logPre.textContent;
-    if (previous && text.startsWith(previous)) {
-      logPre.append(document.createTextNode(text.slice(previous.length)));
+    if (text.trim() === '') {
+      if (firstLoad) { logPre.textContent = ''; addEmptyLogHint(); }
     } else {
-      logPre.textContent = text;
+      removeEmptyHint();
+      /* 增量追加新行：全量重写会打断用户选区并让滚动位置漂移。 */
+      const previous = firstLoad ? '' : logPre.textContent;
+      if (previous && text.startsWith(previous)) {
+        logPre.append(document.createTextNode(text.slice(previous.length)));
+      } else {
+        logPre.textContent = text;
+      }
     }
     logBody.setAttribute('aria-busy', 'false');
     if (nearBottom) requestAnimationFrame(() => {
@@ -725,26 +750,39 @@ async function fetchLogs(appId, requestSeq) {
     }
   }
 }
+
+function removeEmptyHint() {
+  logBody.querySelectorAll('.logs-empty-hint').forEach(n => n.remove());
+}
+function clearLogBody() {
+  removeEmptyHint();
+  logPre.textContent = '加载中…';
+}
+function addEmptyLogHint() {
+  const hint = el('p', 'logs-empty-hint');
+  hint.textContent = '该应用还没有日志';
+  logBody.appendChild(hint);
+}
+
 export function closeLogs() {
-  logRequestSeq += 1;
-  if (logTimer) { clearTimeout(logTimer); logTimer = null; }
-  if (logController) { logController.abort(); logController = null; }
-  logAppId = null;
-  logBody.setAttribute('aria-busy', 'false');
-  closeLayer(logDrawer);
-  drawerMask.classList.remove('open');
-  drawerMask.setAttribute('aria-hidden', 'true');
+  stopLogPolling();
 }
 export function initLogDrawer() {
-  drawerClose.addEventListener('click', closeLogs);
-  drawerMask.addEventListener('click', closeLogs);
+  setChildren(logsRefresh, icon('refresh-cw', 13));
+  logsRefresh.addEventListener('click', () => {
+    if (logAppId === null) return;
+    const appId = logAppId, seq = ++logRequestSeq;
+    stopLogPolling();
+    logRequestSeq = seq;
+    logBody.setAttribute('aria-busy', 'true');
+    clearLogBody();
+    fetchLogs(appId, seq);
+  });
   document.addEventListener('visibilitychange', () => {
-    if (!logAppId) return;
+    if (logAppId === null) return;
     if (document.hidden) {
-      logRequestSeq += 1;
-      if (logTimer) { clearTimeout(logTimer); logTimer = null; }
-      if (logController) { logController.abort(); logController = null; }
-    } else {
+      stopLogPolling();
+    } else if (state.view === 'logs') {
       fetchLogs(logAppId, ++logRequestSeq);
     }
   });

@@ -8,7 +8,7 @@
 import { $, el, setText, setChildren, icon, state, fmtClock, taskExitStatus,
   openLayer, closeLayer, act, post, toast, escapeHtml, applyTheme,
   taskNotificationsEnabled, toggleTaskNotifications } from './core.js';
-import { openAppModal, openLogs, openConsoleLog, openConfirm } from './overlays.js';
+import { openAppModal, selectLog, selectedLogAppId, openConfirm } from './overlays.js';
 import { configuredPort } from './ports.js';
 
 const FEED_CAP = 50;
@@ -62,9 +62,9 @@ export function initWidgets() {
   });
   setChildren($('#railIconLogs'), icon('file-text', 19));
   setChildren($('#railIconSettings'), icon('settings', 19));
-  $('#logsMaskClose').addEventListener('click', closeLogsCenter);
-  $('#logsMask').addEventListener('mousedown', e => {
-    if (e.target === $('#logsMask')) closeLogsCenter();
+  logsFilter.addEventListener('input', () => {
+    logsFilterText = logsFilter.value;
+    renderLogsList();
   });
   $('#settingsMaskClose').addEventListener('click', closeSettingsCenter);
   $('#settingsMask').addEventListener('mousedown', e => {
@@ -335,13 +335,16 @@ export function renderWidgets(data) {
 }
 
 /* ============================================================
-   日志中心（聚合弹层，⌘J）：所有应用与总控台日志的目录页
+   日志中心（独立视图，⌘J）：左侧应用列表 + 右侧日志详情
    ============================================================ */
-const logsMask = $('#logsMask'), logsList = $('#logsList');
+const logsList = $('#logsList'), logsFilter = $('#logsFilter');
+let logsFilterText = '';
 
-function logsRow(app) {
+function logsRow(app, selectedId) {
   const row = el('button', 'logs-item');
   row.type = 'button';
+  const id = app.id;
+  if (id === selectedId) { row.classList.add('sel'); row.setAttribute('aria-current', 'true'); }
   const box = el('span', 'logs-ic');
   if (app.icon) {
     const img = new Image();
@@ -362,22 +365,39 @@ function logsRow(app) {
   sub.textContent = (app.running ? '运行中' : '已停止') +
     (isTask ? ' · 任务' : port ? ' · :' + port : '');
   main.append(name, sub);
-  row.append(box, main, icon('chevron-right', 14));
+  row.append(box, main);
   row.addEventListener('click', () => {
-    closeLogsCenter();
-    openLogs(app);
+    selectLog(app.id, (app.name || '') + ' · 日志');
+    renderLogsList();
   });
   return row;
 }
 
-function renderLogsList() {
+export function renderLogsList() {
+  const selectedId = selectedLogAppId();
   logsList.replaceChildren();
   const apps = (state.data && state.data.apps) || [];
-  const sorted = apps.slice().sort((a, b) => (!!b.running) - (!!a.running));
-  for (const app of sorted) logsList.appendChild(logsRow(app));
-  /* 总控台自身日志固定在最后 */
+  const q = logsFilterText.trim().toLowerCase();
+  const filtered = !q ? apps : apps.filter(a =>
+    ((a.name || '') + ' ' + ((a.project) || '') + ' ' + ((a.command) || '')).toLowerCase().includes(q));
+  const sorted = filtered.slice().sort((a, b) => (!!b.running) - (!!a.running));
+  for (const app of sorted) logsList.appendChild(logsRow(app, selectedId));
+  /* 总控台自身日志固定在最后（搜索命中名称时也显示） */
+  if (!q || '总控台日志'.toLowerCase().includes(q.toLowerCase())) {
+    const row = consoleLogRow(selectedId);
+    logsList.appendChild(row);
+  }
+  if (!sorted.length && !(!q || '总控台日志'.toLowerCase().includes(q))) {
+    const empty = el('div', 'logs-empty');
+    empty.textContent = q ? '没有匹配的应用' : '启动台还没有应用；上方是总控台自身日志';
+    logsList.prepend(empty);
+  }
+}
+
+function consoleLogRow(selectedId) {
   const row = el('button', 'logs-item');
   row.type = 'button';
+  if ('console' === selectedId) { row.classList.add('sel'); row.setAttribute('aria-current', 'true'); }
   const box = el('span', 'logs-ic');
   box.appendChild(icon('terminal', 14));
   const main = el('span', 'logs-main');
@@ -386,24 +406,19 @@ function renderLogsList() {
   const sub = el('span', 'logs-sub');
   sub.textContent = '系统 · console.log';
   main.append(name, sub);
-  row.append(box, main, icon('chevron-right', 14));
+  row.append(box, main);
   row.addEventListener('click', () => {
-    closeLogsCenter();
-    openConsoleLog();
+    selectLog('console', '总控台 · 日志');
+    renderLogsList();
   });
-  logsList.appendChild(row);
-  if (!apps.length) {
-    const empty = el('div', 'logs-empty');
-    empty.textContent = '启动台还没有应用；上方是总控台自身日志';
-    logsList.prepend(empty);
-  }
+  return row;
 }
 
+/* “打开日志中心”入口：切换到日志中心视图（无需繁琐确认）。 */
 export function openLogsCenter() {
-  renderLogsList();
-  openLayer(logsMask, $('#logsMaskClose'));
+  if (window.__goLogsView) window.__goLogsView();
+  else window.__switchView && window.__switchView('logs');
 }
-export function closeLogsCenter() { closeLayer(logsMask); }
 
 /* ============================================================
    设置中心（聚合弹层）：通知开关 / 外观 / 版本与目录信息

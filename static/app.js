@@ -12,11 +12,11 @@ import { $, el, setText, setChildren, icon, escapeHtml,
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
-import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
+import { initWidgets, renderWidgets, renderLogsList, openLogsCenter,
   openSettingsCenter, closeSettingsCenter, resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
-  openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
-  openConsoleLog } from './js/overlays.js';
+  openAppModal, closeAppModal, closeConfirm, openLogs, openConsoleLog,
+  selectLog, startLogView, stopLogView, selectedLogAppId } from './js/overlays.js';
 import { configuredPort, actualPorts, portIsOpenable,
   preferredOpenPort } from './js/ports.js';
 
@@ -39,6 +39,7 @@ const stopConsoleIcon = $('#stopConsoleIcon');
 const stopConsoleLabel = $('#stopConsoleLabel');
 const viewLaunchpad = $('#view-launchpad');
 const viewServices = $('#view-services');
+const viewLogs = $('#view-logs');
 /* 只有 data-view 的导航轨按钮参与视图切换；data-action 按钮由 widgets 代理 */
 const railBtns = [...document.querySelectorAll('.rail-btn[data-view]')];
 const sideLaunch = $('#sideLaunch');
@@ -47,16 +48,37 @@ const sideSvc = $('#sideSvc');
 let firstRender = true;          // 首屏渲染（stagger 入场）
 
 /* ---------------- 视图切换 ---------------- */
+function viewRoot(v) {
+  return v === 'launchpad' ? viewLaunchpad : v === 'services' ? viewServices : viewLogs;
+}
 function switchView(v) {
   if (state.view === v) return;
+  if (state.view === 'logs' && v !== 'logs') stopLogView();
   state.view = v;
   localStorage.setItem('console-view', v);
   applyView();
+  if (v === 'logs') enterLogsView();
   /* 强制重排以重播视图进入动画 */
-  const active = v === 'launchpad' ? viewLaunchpad : viewServices;
+  const active = viewRoot(v);
   active.classList.remove('active');
   void active.offsetWidth;
   active.classList.add('active');
+}
+function enterLogsView() {
+  renderLogsList();
+  /* 优先定位用户请求的应用（openLogs/openConsoleLog 传递的挂起目标） */
+  const pending = window.__pendingLogsTarget;
+  if (pending) {
+    selectLog(pending.appId, pending.title);
+    window.__pendingLogsTarget = null;
+    return;
+  }
+  /* 已选中过则续拉，否则默认打开第一个运行中/第一个应用；无应用看总控台日志 */
+  if (selectedLogAppId() !== null) { startLogView(); return; }
+  const apps = (state.data && state.data.apps) || [];
+  const first = apps.find(a => a.running) || apps[0];
+  if (first) selectLog(first.id, (first.name || '') + ' · 日志');
+  else selectLog('console', '总控台 · 日志');
 }
 function applyView() {
   const v = state.view;
@@ -74,16 +96,21 @@ function applyView() {
   });
   sideLaunch.hidden = v !== 'launchpad';
   sideSvc.hidden = v !== 'services';
-  viewLaunchpad.classList.toggle('active', v === 'launchpad');
-  viewServices.classList.toggle('active', v === 'services');
-  viewLaunchpad.setAttribute('aria-hidden', String(v !== 'launchpad'));
-  viewServices.setAttribute('aria-hidden', String(v !== 'services'));
-  setText(viewTitle, v === 'launchpad' ? '启动台' : '服务监控');
+  const views = { 'launchpad': viewLaunchpad, 'services': viewServices, 'logs': viewLogs };
+  for (const key of Object.keys(views)) {
+    const el = views[key];
+    const active = key === v;
+    el.classList.toggle('active', active);
+    el.setAttribute('aria-hidden', String(!active));
+  }
+  setText(viewTitle, v === 'launchpad' ? '启动台' : v === 'services' ? '服务监控' : '日志中心');
   document.documentElement.dataset.view = v;
-  setText(viewOverline, v === 'launchpad' ? 'Launchpad' : 'Services');
+  setText(viewOverline, v === 'launchpad' ? 'Launchpad' : v === 'services' ? 'Services' : 'Logs');
   setText(viewSub, v === 'launchpad'
     ? '一键启动与管理你的本地服务和批处理任务'
-    : '实时掌握本机监听端口与进程负载');
+    : v === 'services'
+      ? '实时掌握本机监听端口与进程负载'
+      : '左侧选择应用，右侧查看实时日志');
 }
 navBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
 railBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
@@ -272,7 +299,24 @@ function render() {
   renderLaunchpad(state.data.apps || [], firstRender);
   renderServices(state.data, firstRender);
   renderWidgets(state.data);
+  maybeRefreshLogsList();
   firstRender = false;
+}
+
+/* 日志中心列表仅在应用状态（运行/端口）变化时重建，保持 DOM 稳定不打断操作。 */
+let lastLogsSig = '';
+function logsListSig() {
+  const apps = (state.data && state.data.apps) || [];
+  return apps.map(a => a.id + '|' + (a.running ? 1 : 0) +
+    '|' + (a.port != null ? a.port : '')).join(',');
+}
+function maybeRefreshLogsList() {
+  if (state.view !== 'logs') {
+    lastLogsSig = '';
+    return;
+  }
+  const sig = logsListSig();
+  if (sig !== lastLogsSig) { lastLogsSig = sig; renderLogsList(); }
 }
 
 function showConsoleActivationInfo(action) {
@@ -572,24 +616,27 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
     e.preventDefault();
-    if ($('#logsMask').classList.contains('open')) closeLogsCenter();
-    else if (!activeLayer()) openLogsCenter();
+    if (!activeLayer()) openLogsCenter();
   }
 });
 window.__openPalette = openPalette;   // hero 卡等跨模块入口
+/* 跨模块进入日志中心视图；openLogs/openConsoleLog 通过挂起目标定位具体应用 */
+window.__goLogsView = (appId, title) => {
+  if (appId !== undefined) window.__pendingLogsTarget = { appId: appId, title: title };
+  switchView('logs');
+};
+window.__switchView = switchView;
 
 /* Esc 逐层关闭浮层 */
 document.addEventListener('keydown', e => {
   trapLayerFocus(e);
   if (e.key === 'Escape') {
     if ($('#confirmMask').classList.contains('open')) closeConfirm();
-    else if ($('#logsMask').classList.contains('open')) closeLogsCenter();
     else if ($('#settingsMask').classList.contains('open')) closeSettingsCenter();
     else if ($('#portDiagMask').classList.contains('open')) closePortDiagnostic();
     else if ($('#appDiagMask').classList.contains('open')) closeAppDiagnosis();
     else if ($('#appModalMask').classList.contains('open')) closeAppModal();
     else if (paletteMask.classList.contains('open')) closePalette();
-    else if ($('#logDrawer').classList.contains('open')) closeLogs();
   }
 });
 
@@ -601,6 +648,7 @@ setChildren(stopConsoleIcon, icon('power', 14));
 setChildren($('#githubLink'), icon('github', 15));
 setChildren($('#navIconLaunch'), icon('layout-grid', 15));
 setChildren($('#navIconSvc'), icon('activity', 15));
+setChildren($('#navIconLogs'), icon('file-text', 15));
 setChildren($('#railIconLaunch'), icon('rocket', 19));
 setChildren($('#railIconSvc'), icon('activity', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));
