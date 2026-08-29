@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>登录 · 总控台</title>
+<meta name="description" content="登录 console-ui 控制台">
+<link rel="icon" href="./assets/favicon-32.png" type="image/png" sizes="32x32">
+<link rel="icon" href="./assets/favicon.ico" sizes="any">
+<link rel="preload" href="./fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./themes/ops.css" id="themeCss">
+<link rel="stylesheet" href="./base.css">
+<link rel="stylesheet" href="./login.css">
+</head>
+<body class="login-page">
+
+<!-- 深浅色切换（右上角，与主界面行为一致） -->
+<button class="icon-btn login-theme" id="themeBtn" type="button" title="切换主题" aria-label="切换主题"></button>
+
+<main class="login-wrap">
+  <section class="login-card" aria-labelledby="loginTitle">
+    <!-- 品牌区：复用顶栏的 .brand-icon / .brand-text 样式 -->
+    <div class="login-head">
+      <span class="brand-icon" aria-hidden="true"><img src="./assets/brand-mark.png" alt=""></span>
+      <div class="brand-text">
+        <h1 id="loginTitle">总控台</h1>
+        <p>Console · Local Ops</p>
+      </div>
+    </div>
+
+    <p class="login-sub">登录后访问启动台与服务监控</p>
+
+    <form id="loginForm" novalidate>
+      <div class="field">
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" autocomplete="username"
+               placeholder="请输入用户名" spellcheck="false" required>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password"
+               placeholder="请输入密码" required>
+      </div>
+
+      <div class="login-error" id="loginError" role="alert" hidden></div>
+
+      <button class="btn btn-accent login-submit" id="loginSubmit" type="submit">登 录</button>
+    </form>
+
+    <div class="login-hint">演示账号：admin / admin123</div>
+
+    <div class="login-foot">
+      <span>console-ui</span>
+      <span class="mono">v1.0.0</span>
+    </div>
+  </section>
+</main>
+
+<script src="./config.js" defer></script>
+<script src="./icons.js" defer></script>
+<script src="./js/login.js" type="module" defer></script>
+</body>
+</html>

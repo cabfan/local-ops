@@ -1,0 +1,145 @@
+/* finesse · register=product · A=tinted-neutral-pair · B=interface-mono · C=centered-single-surface
+ * D=CSS-static · E=hairline+dot-grid · SOUL=4 SPECTACLE=1 DENSITY=5 */
+/* ============================================================
+   login.css — 登录页布局（仅布局；全部视觉令牌来自 themes/ops.css）
+   复用主界面的 .btn / .btn-accent / .field / .brand-icon / .brand-text
+   / .icon-btn / .modal-title 等组件类，保证风格严格一致
+
+   背景处理（finesse-ui · product 注册表 · product-ui.md §0 配方）：
+   双层级中性色（--room 页面 / --card 卡片）+ 精密点阵肌理 +
+   右上角单枚品牌色角部辉光（径向渐变，18% 强调色 → 透明）。
+   单色、静态、无动画 —— 产品界面的克制语言，无品牌语法。
+   ============================================================ */
+
+body.login-page {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: hidden;
+  background: var(--room);
+}
+
+/* 层 1：精密点阵肌理（单色，由 --ink 推导，深浅色自动适配） */
+body.login-page::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: radial-gradient(
+    color-mix(in srgb, var(--ink) 7%, transparent) 1.4px,
+    transparent 1.6px);
+  background-size: 24px 24px;
+}
+
+/* 层 2：右上角品牌色角部辉光（product-ui.md §0.1 浮层面板配方，
+   单枚强调色、低透明度、静态 —— 不做多色、不做动画） */
+body.login-page::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    340px 260px at 92% -3%,
+    color-mix(in srgb, var(--accent) 18%, transparent),
+    transparent 60%);
+}
+
+/* 内容层提到背景之上 */
+.login-wrap {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 右上角主题切换按钮 */
+.login-theme {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 10;
+}
+
+.login-card {
+  width: 396px;
+  max-width: 100%;
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--shadow-lg);
+  padding: 32px 30px 24px;
+  animation: login-in 0.3s var(--ease);
+}
+@keyframes login-in {
+  from { opacity: 0; transform: translateY(10px); }
+}
+
+/* 品牌区：顶栏同款（34px 图标盒 + 名称 + 等宽 overline） */
+.login-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.login-sub {
+  margin: 0 0 22px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+
+/* 错误提示条：红系弱底 + 细红边，与表单错误语义一致 */
+.login-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: -4px 0 14px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--red) 40%, var(--line-2));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--red) 7%, var(--card));
+  color: var(--red);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.login-submit {
+  width: 100%;
+  height: 38px;
+  margin-top: 2px;
+}
+
+.login-hint {
+  margin: 16px 0 0;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--ink-4);
+}
+
+.login-foot {
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--ink-4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-card { animation: none; }
+}
+
+/* 窄屏：卡片贴边 */
+@media (max-width: 480px) {
+  body.login-page { padding: 14px; align-items: flex-start; padding-top: 9vh; }
+}
