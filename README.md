@@ -229,10 +229,13 @@ Windows 上用脚本启动，等价于 Linux 的 `start.sh`：
 ```bash
 CONSOLE_DATA_DIR="/private/path/console-data" \
 CONSOLE_LOG_DIR="/private/path/console-logs" \
+CONSOLE_REVIEW_DIR="/private/path/console-review" \
 python3 server.py
 ```
 
 自定义值必须是非空的绝对路径，并指向总控台专用的非符号链接子目录；不要直接填 `/`、用户主目录或项目根目录。
+
+`CONSOLE_REVIEW_DIR` 仅影响每日代码审查克隆仓库的工作目录（默认 `<数据目录>/review`）；显式设置时同样不做旧目录自动迁移。
 
 ### 备份
 

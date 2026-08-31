@@ -114,6 +114,8 @@ DATA_DIR, DATA_DIR_OVERRIDDEN = resolve_runtime_dir(
 ICONS_DIR = os.path.join(DATA_DIR, "icons")
 LOGS_DIR, LOGS_DIR_OVERRIDDEN = resolve_runtime_dir(
     "CONSOLE_LOG_DIR", DEFAULT_LOGS_DIR)
+REVIEW_WORK_DIR = resolve_runtime_dir(
+    "CONSOLE_REVIEW_DIR", os.path.join(DATA_DIR, "review"))[0]
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -3908,14 +3910,23 @@ def review_has_run_today(db_path, day):
                             "SELECT day FROM review_summary WHERE day=?",
                             (day,)))
 
-def review_save_report(db_path, day, project, text):
+def review_save_report_row(db_path, day, project_id, project_name, text):
+    """按（日期, 项目名）覆盖写入一条报告。"""
+    _auth_exec(db_path,
+               "DELETE FROM review_reports WHERE day=? AND project_name=?",
+               (day, project_name))
     _auth_exec(db_path,
                "INSERT INTO review_reports(day, project_id, project_name, "
                "summary, findings, created_at) VALUES(?,?,?,?,?,?)",
-               (day, project["id"], project["name"], text, "",
+               (day, project_id, project_name, text, "",
                 datetime.datetime.now().isoformat(timespec="seconds")))
 
+def review_save_report(db_path, day, project, text):
+    # 同日同项目覆盖：重跑审查只保留最新一份，避免重复行累积。
+    review_save_report_row(db_path, day, project["id"], project["name"], text)
+
 def review_save_summary(db_path, day, text):
+    _auth_exec(db_path, "DELETE FROM review_summary WHERE day=?", (day,))
     _auth_exec(db_path,
                "INSERT INTO review_summary(day, summary, generated_at) "
                "VALUES(?,?,?)",
@@ -3948,6 +3959,14 @@ def review_push_logs(cfg, day=None):
                            "SELECT * FROM review_push_logs ORDER BY id DESC "
                            "LIMIT 50")
     return [dict(r) for r in rows]
+
+def review_delete_day(cfg, day):
+    """清除指定日期的报告、汇总与推送日志；与审查执行互斥。"""
+    with REVIEW_DAILY_LOCK:
+        for table in ("review_reports", "review_summary", "review_push_logs"):
+            _auth_exec(_review_db(cfg),
+                       "DELETE FROM %s WHERE day=?" % table, (day,))
+    return True
 
 # ---------- git 采集与 AI 审查 ----------
 
@@ -4110,17 +4129,115 @@ def review_push_report(cfg, day):
                (day, endpoint, status, code, message, now))
     return status
 
+HERMES_TIMEOUT_SEC = 900
+_HERMES_SECTION_RE = re.compile(r"^## 项目[:：]\s*(.+)$", re.M)
+
+def _hermes_command():
+    """定位本机 hermes CLI；优先 PATH，回落标准 venv 安装路径。"""
+    exe = shutil.which("hermes")
+    if exe:
+        return [exe]
+    venv_python = os.path.expanduser(
+        "~/.hermes/hermes-agent/venv/bin/python")
+    if os.path.exists(venv_python):
+        return [venv_python, "-m", "hermes_cli.main"]
+    return None
+
+def _build_hermes_prompt(day, repos):
+    listing = "\n".join("- %s（默认分支 %s）" % (r["name"], r["branch"])
+                        for r in repos)
+    return (
+        "你是资深代码审查专家。今天是 %s。当前目录下有若干已克隆的 Git 仓库：\n\n"
+        "%s\n\n"
+        "请完成本日代码审查：\n"
+        "1. 逐个仓库检查其所有分支（含 origin/* 远程分支）在 %s 当天是否有提交"
+        "（例如 git log --all --since=\"%s 00:00\" --until=\"%s 23:59:59\"）。\n"
+        "2. 只输出当天有提交的仓库；无提交的仓库不要出现。\n"
+        "3. 每个有提交的仓库输出一节，该节第一行必须是「## 项目：<仓库名>」，内容包括：\n"
+        "   - 按分支统计当天提交（分支名、提交数、主要作者）；\n"
+        "   - **本期概览**：这些提交主要解决什么（一两句）；\n"
+        "   - **发现的问题**：安全、性能、兼容性等，逐条列出，没有写「无」；\n"
+        "   - **提交清单**：按分支列出提交摘要。\n"
+        "4. 全部仓库之后，如有跨项目共性问题，追加一节「## 跨项目风险」。\n"
+        "要求：用 git show/diff 查看实际代码改动并结合上下文源码判断，"
+        "不要只看提交说明；输出精炼 Markdown，不复述 diff 全文。\n"
+        % (day, listing, day, day, day))
+
+def _hermes_review(workdir, prompt):
+    """一次性调用本机 hermes agent 执行审查，返回其 stdout。"""
+    cmd = _hermes_command()
+    if not cmd:
+        raise RuntimeError("未找到 hermes CLI")
+    proc = subprocess.run(
+        cmd + ["-z", prompt, "--in", workdir, "--safe-mode"],
+        capture_output=True, text=True, errors="replace",
+        timeout=HERMES_TIMEOUT_SEC, cwd=workdir)
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        raise RuntimeError("hermes 执行失败: %s"
+                           % ((proc.stderr or proc.stdout or "无输出")[:300]))
+    return proc.stdout.strip()
+
+def _parse_hermes_sections(text):
+    """按「## 项目：<名称>」切分为 [(名称, 小节全文)]；无分节时返回 []。"""
+    matches = list(_HERMES_SECTION_RE.finditer(text or ""))
+    sections = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append((m.group(1).strip(), text[m.end():end].strip()))
+    return sections
+
+def _review_run_hermes(cfg, db, day, projects, workdir):
+    """hermes agent 模式：准备仓库→一次性审查→按项目分节入库。
+    返回汇总文本；hermes 不可用/失败时返回 None 回退逐项目流程。"""
+    repos = []
+    total = len(projects)
+    for idx, project in enumerate(projects, 1):
+        _review_job_update(stage="克隆/更新仓库 %d/%d" % (idx, total))
+        try:
+            target = _review_fetch(project["remote"],
+                                   project.get("branch") or "main",
+                                   workdir, project)
+        except Exception:
+            LOG.exception("审查仓库准备失败: %s", project.get("name"))
+            continue
+        if target:
+            repos.append({"name": _review_safe_name(project["name"]),
+                          "branch": project.get("branch") or "main",
+                          "dir": target})
+    if not repos:
+        return None
+    _review_job_update(stage="hermes agent 审查中（约需数分钟）")
+    try:
+        text = _hermes_review(workdir, _build_hermes_prompt(day, repos))
+    except Exception:
+        LOG.exception("hermes 审查失败，回退逐项目流程")
+        return None
+    _review_job_update(stage="解析报告并入库")
+    by_name = {_review_safe_name(p["name"]): p["id"] for p in projects}
+    for name, body in _parse_hermes_sections(text):
+        review_save_report_row(db, day, by_name.get(name, 0), name, body)
+    review_save_summary(db, day, text)
+    return text
+
 def review_run_day(cfg, day):
     """对全部启用项目抓取当日提交并生成报告；返回汇总 Markdown。"""
     review = _review_cfg(cfg)
     ai = review.get("ai") or {}
     projects = [p for p in review_projects(cfg) if p["enabled"]]
     db = _review_db(cfg)
-    workdir = os.path.join(DATA_DIR, "review")
+    workdir = REVIEW_WORK_DIR
     try:
         _ensure_private_dir(workdir)
     except OSError:
         workdir = None
+    if workdir and projects:
+        hermes_text = _review_run_hermes(cfg, db, day, projects, workdir)
+        if hermes_text is not None:
+            try:
+                review_push_report(cfg, day)
+            except Exception:
+                LOG.exception("报告推送失败")
+            return hermes_text
     reports = []
     for project in projects:
         try:
@@ -4151,8 +4268,56 @@ def review_run(cfg, day=None):
 
 REVIEW_DAILY_LOCK = threading.Lock()
 
+REVIEW_JOB_LOCK = threading.Lock()
+REVIEW_JOB = {"running": False, "day": None, "stage": "",
+              "startedAt": None, "finishedAt": None, "ok": None, "error": ""}
+
+def _review_now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+def _review_job_update(**kw):
+    with REVIEW_JOB_LOCK:
+        REVIEW_JOB.update(kw)
+
+def review_job_status():
+    with REVIEW_JOB_LOCK:
+        return dict(REVIEW_JOB)
+
+def review_run_tracked(cfg, day):
+    """同步执行一次审查并维护 REVIEW_JOB 状态（手动异步与定时共用）。"""
+    _review_job_update(running=True, day=day, stage="准备中",
+                       startedAt=_review_now(), finishedAt=None,
+                       ok=None, error="")
+    try:
+        with REVIEW_DAILY_LOCK:
+            review_run_day(cfg, day)
+        _review_job_update(running=False, ok=True, stage="完成",
+                           finishedAt=_review_now())
+        return True
+    except Exception as e:
+        LOG.exception("每日代码审查执行失败")
+        _review_job_update(running=False, ok=False, stage="失败",
+                           error=str(e)[:200], finishedAt=_review_now())
+        return False
+
+def review_start_async(cfg, day):
+    """异步执行一次审查；已有任务在执行时返回 False。"""
+    with REVIEW_JOB_LOCK:
+        if REVIEW_JOB["running"]:
+            return False
+        REVIEW_JOB.update(running=True, day=day, stage="排队中",
+                          startedAt=_review_now(), finishedAt=None,
+                          ok=None, error="")
+    def worker():
+        review_run_tracked(cfg, day)
+    threading.Thread(target=worker, daemon=True,
+                     name="review-job").start()
+    return True
+
 def start_review_scheduler():
-    """每日定时（默认 03:00）+ 重启漏跑补偿，daemon 线程。"""
+    """每日定时（默认 03:00）+ 重启漏跑补偿，daemon 线程。
+
+    定时任务在凌晨执行，此时当日尚无提交，审查目标日为上一个自然日。"""
     def attempt():
         cfg = Config(CONFIG_PATH)
         review = _review_cfg(cfg)
@@ -4160,22 +4325,18 @@ def start_review_scheduler():
         if not sched.get("enabled"):
             return
         db = auth_db_path(cfg)
-        today = datetime.date.today().isoformat()
-        if review_has_run_today(db, today):
+        review_day = (datetime.date.today()
+                      - datetime.timedelta(days=1)).isoformat()
+        if review_has_run_today(db, review_day):
             return
         hour = int(sched.get("hour", 3))
         minute = int(sched.get("minute", 0))
         now = datetime.datetime.now()
         reached = (now.hour, now.minute) == (hour, minute)
         passed = now.hour > hour or (now.hour == hour and now.minute >= minute)
-        # 到达设定时刻，或已过设定时刻（当日漏跑补偿，仅补当天）。
+        # 到达设定时刻，或已过设定时刻（漏跑补偿：补审昨日，仅补一次）。
         if reached or passed:
-            with REVIEW_DAILY_LOCK:
-                if not review_has_run_today(db, today):
-                    try:
-                        review_run_day(cfg, today)
-                    except Exception:
-                        LOG.exception("每日代码审查执行失败")
+            review_run_tracked(cfg, review_day)
     def target():
         while True:
             try:
@@ -4506,6 +4667,12 @@ class Handler(BaseHTTPRequestHandler):
             "pushLogs": review_push_logs(cfg, day),
         })
 
+    def handle_review_reports_delete(self, day):
+        cfg = self.server.cfg
+        review_delete_day(cfg, day)
+        LOG.info("已清除 %s 的代码审查报告", day)
+        self.send_json({"ok": True, "day": day})
+
     def handle_review_projects_create(self):
         cfg = self.server.cfg
         data, err = self.read_json_body()
@@ -4556,12 +4723,15 @@ class Handler(BaseHTTPRequestHandler):
                 day = qday
         except Exception:
             pass
-        try:
-            summary = review_run(cfg, day)
-        except Exception as e:
-            self.send_err(500, "审查执行失败：%s" % (str(e) or "未知错误"))
+        if not review_start_async(cfg, day):
+            self.send_json({"ok": False, "error": "已有审查任务在执行",
+                            "job": review_job_status()})
             return
-        self.send_json({"ok": True, "day": day, "summary": summary})
+        self.send_json({"ok": True, "started": True, "day": day,
+                        "job": review_job_status()})
+
+    def handle_review_job(self):
+        self.send_json({"ok": True, "job": review_job_status()})
 
     def handle_review_config(self):
         cfg = self.server.cfg
@@ -4789,6 +4959,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/review":
                 self.handle_review_state()
+                return
+            if path == "/api/review/status":
+                self.handle_review_job()
                 return
             if path == "/api/review/reports":
                 day = (urllib.parse.parse_qs(parsed.query)
@@ -5550,6 +5723,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.handle_review_project_delete(int(rest))
                 else:
                     self.send_err(404, "接口不存在")
+                return
+            if path.startswith("/api/review/reports/"):
+                day = path[len("/api/review/reports/"):]
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+                    self.send_err(400, "日期格式必须是 YYYY-MM-DD")
+                else:
+                    self.handle_review_reports_delete(day)
                 return
             if not m:
                 self.send_err(404, "接口不存在")

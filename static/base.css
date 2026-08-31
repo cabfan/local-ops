@@ -1004,11 +1004,65 @@ html[data-theme="dark"] .login-remember { color: var(--login-ink-2, #9aa0b0); }
 .rv-empty { font-size: 13px; color: var(--ink-4, #8a8f9c); padding: 8px 2px; }
 .rv-reports { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
 .rv-markdown {
-  margin: 0; padding: 12px 14px; font: 12px/1.7 var(--font-mono, monospace);
-  white-space: pre-wrap; word-break: break-word;
+  padding: 12px 14px; font-size: 13px; line-height: 1.7;
+  word-break: break-word;
   border: 1px solid var(--line, #e4e7ef); border-radius: 10px;
   background: var(--card-2, #f6f8fc); color: var(--ink, #171a24);
 }
+.rv-markdown h1, .rv-markdown h2, .rv-markdown h3,
+.rv-markdown h4, .rv-markdown h5, .rv-markdown h6 {
+  margin: 10px 0 6px; font-size: 13px; font-weight: 600;
+  color: var(--ink, #171a24);
+}
+.rv-markdown h1:first-child, .rv-markdown h2:first-child,
+.rv-markdown h3:first-child { margin-top: 0; }
+.rv-markdown p { margin: 6px 0; }
+.rv-markdown ul, .rv-markdown ol { margin: 6px 0; padding-left: 20px; }
+.rv-markdown li { margin: 2px 0; }
+.rv-markdown pre {
+  margin: 8px 0; padding: 8px 10px; overflow-x: auto;
+  font: 12px/1.6 var(--font-mono, monospace);
+  background: var(--card, #fff); border-radius: 8px;
+  border: 1px solid var(--line, #e4e7ef);
+}
+.rv-markdown code {
+  font: 12px/1.5 var(--font-mono, monospace);
+  background: var(--card, #fff); border-radius: 4px; padding: 1px 4px;
+}
+.rv-markdown pre code { background: none; padding: 0; }
+.rv-markdown blockquote {
+  margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--line, #e4e7ef);
+  color: var(--ink-2, #5a6072);
+}
+.rv-markdown hr { margin: 10px 0; border: none;
+  border-top: 1px solid var(--line, #e4e7ef); }
+.rv-markdown a { color: var(--accent, #3b6ef5); }
+.rv-job {
+  margin-left: 10px; font-size: 12px; font-weight: 500;
+  color: var(--accent, #3b6ef5);
+}
+.rv-job::before {
+  content: ''; display: inline-block; width: 8px; height: 8px;
+  margin-right: 5px; border-radius: 50%;
+  background: currentColor; vertical-align: 1px;
+  animation: rv-job-pulse 1.2s ease-in-out infinite;
+}
+@keyframes rv-job-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rv-job::before { animation: none; }
+}
+.rv-markdown table {
+  margin: 8px 0; border-collapse: collapse; width: 100%;
+  font-size: 12px;
+}
+.rv-markdown th, .rv-markdown td {
+  border: 1px solid var(--line, #e4e7ef); padding: 4px 8px;
+  text-align: left; vertical-align: top;
+}
+.rv-markdown th { background: var(--card, #fff); font-weight: 600; }
 .rv-item { display: flex; flex-direction: column; gap: 6px; }
 .rv-item-head { font-size: 13px; font-weight: 600; color: var(--ink, #171a24); }
 .rv-push { display: flex; flex-direction: column; gap: 4px; font-size: 12px;
