@@ -4312,6 +4312,19 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError):
             return False
 
+    def _has_valid_login_session(self):
+        """是否携带有效登录口令会话（强制登录模式下视为受信任浏览器）。
+
+        用于登录来源即便不在回环/LAN 白名单，也能拿到控制会话 cookie，
+        从而执行受控写操作（启动/停止项目等）。
+        """
+        try:
+            return (self._login_enforced()
+                    and auth_validate_session(
+                        self.server.cfg, self._login_cookie_token()))
+        except Exception:
+            return False
+
     # ---------- 登录门控 ----------
 
     def _login_enforced(self):
@@ -4667,7 +4680,8 @@ class Handler(BaseHTTPRequestHandler):
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
             "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
-        if set_cookie and self._request_host_allowed():
+        if set_cookie and (self._request_host_allowed()
+                           or self._has_valid_login_session()):
             self.send_header(
                 "Set-Cookie",
                 "console_session=%s; Path=/; HttpOnly; SameSite=Strict" %
