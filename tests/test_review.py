@@ -136,5 +136,56 @@ class ReviewDataTests(unittest.TestCase):
         self.assertTrue(body["configured"])
 
 
+    def test_public_project_hides_token(self):
+        cfg = self.h.cfg
+        pid, _ = server.review_add_project(cfg, {
+            "name": "sec", "remote": "https://gitlab.example.com/t/sec.git",
+            "auth_type": "token", "auth_token": "glpat-secret123"})
+        self.assertTrue(pid)
+        pub = server._review_public_project(server.review_get_project(cfg, pid))
+        self.assertNotIn("auth_token", pub)
+        self.assertTrue(pub["has_token"])
+        self.assertNotIn("glpat-secret123", json.dumps(pub))
+        # 未配置 token 的项目 has_token 为 False
+        pid2, _ = server.review_add_project(cfg, {
+            "name": "plain", "remote": "https://gitlab.example.com/t/p.git"})
+        pub2 = server._review_public_project(server.review_get_project(cfg, pid2))
+        self.assertFalse(pub2["has_token"])
+
+    def test_update_with_blank_token_keeps_existing(self):
+        cfg = self.h.cfg
+        pid, _ = server.review_add_project(cfg, {
+            "name": "keep", "remote": "https://gitlab.example.com/t/keep.git",
+            "auth_type": "token", "auth_token": "glpat-keep"})
+        # 空 token 只在显式带上时视为保留，编辑其它字段不会清掉凭证
+        self.assertTrue(server.review_update_project(
+            cfg, pid, {"branch": "dev", "auth_token": ""}))
+        updated = server.review_get_project(cfg, pid)
+        self.assertEqual(updated["auth_token"], "glpat-keep")
+        self.assertEqual(updated["branch"], "dev")
+
+    def test_mask_token(self):
+        self.assertEqual(
+            server._review_mask_token(
+                "fatal: unable to access 'https://glpat-x@gitlab.example.com/t.git/'",
+                "glpat-x"),
+            "fatal: unable to access 'https://***@gitlab.example.com/t.git/'")
+        # token 为空时原样返回
+        self.assertEqual(server._review_mask_token("plain message", ""), "plain message")
+
+    def test_http_state_hides_token(self):
+        status, _ = self.h.request("POST", "/api/review/projects", json.dumps({
+            "name": "hides",
+            "remote": "https://gitlab.example.com/t/hides.git",
+            "auth_type": "token", "auth_token": "glpat-net-secret"}))
+        self.assertEqual(status, 200)
+        status, body = self.h.request("GET", "/api/review")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["projects"]), 1)
+        self.assertNotIn("auth_token", body["projects"][0])
+        self.assertTrue(body["projects"][0]["has_token"])
+        self.assertNotIn("glpat-net-secret", json.dumps(body))
+
+
 if __name__ == "__main__":
     unittest.main()

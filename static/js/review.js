@@ -157,6 +157,7 @@ function projectRow(p) {
   const meta = el('div', 'rv-row-meta');
   meta.textContent = (p.remote || '') +
     (p.branch ? ' · ' + p.branch : '') +
+    (p.has_token ? ' · 已配 Token' : '') +
     (p.last_ran_at ? ' · 上次 ' + p.last_ran_at : '');
   main.append(name, meta);
 

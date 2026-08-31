@@ -3829,6 +3829,18 @@ def _review_safe_name(name):
 def _review_db(cfg):
     return auth_db_path(cfg)
 
+def _review_mask_token(text, token):
+    """错误信息回显前抹掉凭证，避免 token 经日志/报告/前端泄漏。"""
+    if not token:
+        return text
+    return str(text).replace(token, "***")
+
+def _review_public_project(p):
+    """对外输出项目时隐藏 auth_token，只回显是否已配置。"""
+    pub = dict(p)
+    pub["has_token"] = bool(pub.pop("auth_token", "") or "")
+    return pub
+
 def review_projects(cfg):
     rows = _auth_query(_review_db(cfg),
                        "SELECT * FROM review_projects ORDER BY id")
@@ -3867,6 +3879,9 @@ def review_update_project(cfg, pid, data):
     if not row:
         return False
     allowed = ("name", "remote", "auth_type", "auth_token", "branch")
+    if isinstance(data.get("auth_token"), str) and not data["auth_token"].strip():
+        # 空 token 视为「保留原值」，避免编辑其它字段时误清空凭证。
+        data.pop("auth_token")
     sets, params = [], []
     for key in allowed:
         if key in data:
@@ -3964,11 +3979,16 @@ def _review_fetch(remote, branch, workdir, project):
     target = os.path.join(workdir, name) if workdir else None
     if target and not os.path.isdir(os.path.join(target, ".git")):
         try:
-            subprocess.run(["git", "clone", remote, target],
-                           capture_output=True, text=True, errors="replace",
-                           timeout=300)
+            proc = subprocess.run(["git", "clone", remote, target],
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=300)
         except Exception as e:
-            raise RuntimeError("git clone 失败: %s" % (e or "未知错误"))
+            # TimeoutExpired 等异常文本会带上完整命令行（含 token），先打码。
+            raise RuntimeError("git clone 失败: %s"
+                               % (_review_mask_token(e, token) or "未知错误"))
+        if proc.returncode != 0:
+            raise RuntimeError("git clone 失败: %s" % _review_mask_token(
+                (proc.stderr or proc.stdout or "未知错误").strip(), token))
     if target:
         try:
             _git_run(target, "fetch", "origin")
@@ -4458,7 +4478,8 @@ class Handler(BaseHTTPRequestHandler):
                    "apiKeyEnv": (review.get("ai") or {}).get("apiKeyEnv",
                                                              "REVIEW_AI_KEY")},
             "pushEndpoint": (review.get("push") or {}).get("endpoint", ""),
-            "projects": review_projects(cfg),
+            "projects": [_review_public_project(p)
+                         for p in review_projects(cfg)],
             "days": review_days(cfg),
         })
 
@@ -4486,7 +4507,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(400, err)
             return
         self.send_json({"ok": True, "id": pid,
-                        "project": review_get_project(cfg, pid)})
+                        "project": _review_public_project(
+                            review_get_project(cfg, pid))})
 
     def handle_review_project_update(self, pid):
         cfg = self.server.cfg
@@ -4500,7 +4522,8 @@ class Handler(BaseHTTPRequestHandler):
         if not review_update_project(cfg, pid, data):
             self.send_err(404, "项目不存在")
             return
-        self.send_json({"ok": True, "project": review_get_project(cfg, pid)})
+        self.send_json({"ok": True, "project": _review_public_project(
+            review_get_project(cfg, pid))})
 
     def handle_review_project_delete(self, pid):
         cfg = self.server.cfg
