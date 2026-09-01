@@ -4327,15 +4327,17 @@ def start_review_scheduler():
         db = auth_db_path(cfg)
         review_day = (datetime.date.today()
                       - datetime.timedelta(days=1)).isoformat()
-        if review_has_run_today(db, review_day):
-            return
         hour = int(sched.get("hour", 3))
         minute = int(sched.get("minute", 0))
         now = datetime.datetime.now()
         reached = (now.hour, now.minute) == (hour, minute)
         passed = now.hour > hour or (now.hour == hour and now.minute >= minute)
-        # 到达设定时刻，或已过设定时刻（漏跑补偿：补审昨日，仅补一次）。
-        if reached or passed:
+        if reached:
+            # 到点必跑：报告覆盖写入，白天手动审过的日子也能补上夜间提交。
+            review_run_tracked(cfg, review_day)
+            return
+        # 漏跑补偿：到点时服务不可用，之后才补审（当天已审过则跳过）。
+        if passed and not review_has_run_today(db, review_day):
             review_run_tracked(cfg, review_day)
     def target():
         while True:
