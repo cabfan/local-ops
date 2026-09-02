@@ -173,7 +173,9 @@ async function runNow() {
   const run = ROOT().querySelector('.rv-toolbar .btn.primary');
   run.disabled = true;
   try {
-    const r = await act(post('/api/review/run', {}));
+    /* 用日期选择器当前选中的日期作为审查目标日（后端支持 ?day=）。 */
+    const r = await act(post(
+      '/api/review/run?day=' + encodeURIComponent(selectedDay), {}));
     if (r && r.ok === false) {
       toast(r.error || '执行失败');
       if (r.job && r.job.running) startJobPolling();
